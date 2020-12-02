@@ -1,0 +1,215 @@
+diff --git kernel/x86_64/block/blk-core.c kernel/x86_64/block/blk-core.c
+index 3ca326a..4fc033b 100755
+--- kernel/x86_64/block/blk-core.c
++++ kernel/x86_64/block/blk-core.c
+@@ -2019,9 +2019,10 @@ void submit_bio(long long/*int*/ rw, struct bio *bio)
+ 			get_epoch(current->__epoch);
+ 			bio->bi_epoch = current->__epoch;
+ 			bio->bi_epoch->pending++;
+-			mutex_lock(&q->epoch_id_lock);
+-			g_epoch_id = bio->bi_epoch->eid;
+-			mutex_unlock(&q->epoch_id_lock);
++			bio->bi_epoch->eid = current->epoch_id;
++			//mutex_lock(&q->epoch_id_lock);
++			//g_epoch_id = bio->bi_epoch->eid;
++			//mutex_unlock(&q->epoch_id_lock);
+ 
+ 			if (bio->bi_rw & REQ_BARRIER) {
+ 				blk_finish_epoch();
+@@ -2031,6 +2032,7 @@ void submit_bio(long long/*int*/ rw, struct bio *bio)
+ 				mutex_unlock(&q->epoch_id_lock);
+ 			}
+ 		}
++		current->stream_id = 0; //Jieun add 11_09
+ 		/* end */
+ 	}
+ 
+@@ -2078,9 +2080,10 @@ void submit_bio64(long long rw, struct bio *bio)
+ 			get_epoch(current->__epoch);
+ 			bio->bi_epoch = current->__epoch;
+ 			bio->bi_epoch->pending++;
+-			mutex_lock(&q->epoch_id_lock);
+-			g_epoch_id = bio->bi_epoch->eid;
+-			mutex_unlock(&q->epoch_id_lock);
++			bio->bi_epoch->eid=current->epoch_id;
++		//	mutex_lock(&q->epoch_id_lock);
++		//	g_epoch_id = bio->bi_epoch->eid;
++		//	mutex_unlock(&q->epoch_id_lock);
+ 
+ 			if (bio->bi_rw & REQ_BARRIER) {
+ 				blk_finish_epoch();
+diff --git kernel/x86_64/fs/buffer.c kernel/x86_64/fs/buffer.c
+index 4c0c048..1fb7fb5 100755
+--- kernel/x86_64/fs/buffer.c
++++ kernel/x86_64/fs/buffer.c
+@@ -3122,7 +3122,7 @@ int _submit_bh64(long long rw, struct buffer_head *bh, unsigned long long bio_fl
+ 	 * Type of bi_stream_id is pid_t,
+ 	 * so it is not necessary to type casting.
+ 	 */
+-	bio->bi_stream_id = current->pid;
++	bio->bi_stream_id = current->stream_id;
+ 
+ 	/* Take care of bh's that straddle the end of the device */
+ 	guard_bh_eod(rw, bio, bh);
+diff --git kernel/x86_64/fs/ext4/page-io.c kernel/x86_64/fs/ext4/page-io.c
+index 112cc5d..748eae5 100755
+--- kernel/x86_64/fs/ext4/page-io.c
++++ kernel/x86_64/fs/ext4/page-io.c
+@@ -334,7 +334,7 @@ static int io_submit_init(struct ext4_io_submit *io,
+ 	 * Type of bi_stream_id is pid_t, 
+ 	 * so it is not necessary to type casting.
+ 	 */
+-	bio->bi_stream_id = current->pid;
++	bio->bi_stream_id = current->stream_id;
+ 
+ 
+ 	io_end->offset = (page->index << PAGE_CACHE_SHIFT) + bh_offset(bh);
+diff --git kernel/x86_64/fs/jbd2/commit.c kernel/x86_64/fs/jbd2/commit.c
+index a05fc83..5a027df 100755
+--- kernel/x86_64/fs/jbd2/commit.c
++++ kernel/x86_64/fs/jbd2/commit.c
+@@ -1361,7 +1361,8 @@ void jbd2_journal_barrier_commit_transaction(journal_t *journal)
+ 
+ 	commit_transaction = journal->j_running_transaction;
+ 	J_ASSERT(commit_transaction->t_state == T_RUNNING);
+-
++	//Jieun add 11_09
++	current->stream_id = commit_transaction->stream_id;
+ 	trace_jbd2_start_commit(journal, commit_transaction);
+ 	jbd_debug(1, "JBD2: starting commit of transaction %d\n",
+ 			commit_transaction->t_tid);
+@@ -1691,6 +1692,7 @@ start_journal_io:
+ 					submit_bh64(WRITE_ORDERED, bh);
+ 				} else if (i == bufs - 1 && commit_transaction->t_buffers == NULL) {
+ 					submit_bh64(WRITE_BARRIER, bh);
++					current->epoch_id +=1;
+ 				} else {
+ 					submit_bh64(WRITE_ORDERED, bh);
+ 				}
+@@ -1880,6 +1882,8 @@ start_journal_io:
+ 	J_ASSERT(commit_transaction->t_buffers == NULL);
+ 	J_ASSERT(commit_transaction->t_checkpoint_list == NULL);
+ 
++	
++	current->epoch_id = 0; //Jieun add
+ 	/* Done with this transaction! */
+ 
+ 	jbd_debug(3, "JBD2: commit phase 7\n");
+@@ -1960,6 +1964,8 @@ start_journal_io:
+ 		commit_transaction->t_cpprev->t_cpnext =
+ 			commit_transaction;
+ 	}
++	//Jieun add 11_09
++	current->stream_id = 0;
+ 	spin_unlock(&journal->j_cplist_lock);
+ 
+ 	wake_up(&journal->j_wait_cpsetup);
+diff --git kernel/x86_64/fs/jbd2/journal.c kernel/x86_64/fs/jbd2/journal.c
+index 5d64785..b71bfd8 100755
+--- kernel/x86_64/fs/jbd2/journal.c
++++ kernel/x86_64/fs/jbd2/journal.c
+@@ -1295,6 +1295,9 @@ static journal_t * journal_init_common (void)
+ 	/* The journal is marked for error until we succeed with recovery! */
+ 	journal->j_flags = JBD2_ABORT;
+ 
++	/* Jieun add 11_09 */
++	journal->stream_counter = 1;
++	
+ 	/* Set up a default-sized revoke table for the new mount. */
+ 	err = jbd2_journal_init_revoke(journal, JOURNAL_REVOKE_DEFAULT_HASH);
+ 	if (err) {
+diff --git kernel/x86_64/fs/jbd2/revoke.c kernel/x86_64/fs/jbd2/revoke.c
+index 0a078ae..5ebe34a 100755
+--- kernel/x86_64/fs/jbd2/revoke.c
++++ kernel/x86_64/fs/jbd2/revoke.c
+@@ -132,7 +132,7 @@ static void write_one_revoke_record64(journal_t *, transaction_t *,
+ 				struct list_head *,
+ 				struct buffer_head **, int*,
+ 				struct jbd2_revoke_record_s *, long long);
+-static void flush_descriptor64(journal_t *, struct buffer_ehad *, int, long long);
++static void flush_descriptor64(journal_t *, struct buffer_head *, int, long long);
+ #endif
+ 
+ /* Utility functions to maintain the revoke table */
+diff --git kernel/x86_64/fs/jbd2/transaction.c kernel/x86_64/fs/jbd2/transaction.c
+index d3c71ab..872b5de 100755
+--- kernel/x86_64/fs/jbd2/transaction.c
++++ kernel/x86_64/fs/jbd2/transaction.c
+@@ -89,6 +89,10 @@ jbd2_get_transaction(journal_t *journal, transaction_t *transaction)
+ 	transaction->t_start_time = ktime_get();
+ 	transaction->t_tid = journal->j_transaction_sequence++;
+ 	transaction->t_expires = jiffies + journal->j_commit_interval;
++	/* Jieun add 11_09 */
++	transaction->stream_id = (journal->stream_counter)++;
++	
++
+ 	spin_lock_init(&transaction->t_handle_lock);
+ 	atomic_set(&transaction->t_updates, 0);
+ 	atomic_set(&transaction->t_outstanding_credits, 0);
+@@ -231,7 +235,7 @@ repeat:
+ 	}
+ 
+ 	transaction = journal->j_running_transaction;
+-
++	current->stream_id = transaction->stream_id;
+ 	/*
+ 	 * If the current transaction is locked down for commit, wait for the
+ 	 * lock to be released.
+diff --git kernel/x86_64/include/linux/jbd2.h kernel/x86_64/include/linux/jbd2.h
+index 10fb789..958a6ef 100755
+--- kernel/x86_64/include/linux/jbd2.h
++++ kernel/x86_64/include/linux/jbd2.h
+@@ -467,7 +467,9 @@ struct transaction_s
+ 
+ 	/* Sequence number for this transaction [no locking] */
+ 	tid_t			t_tid;
+-
++	
++	/* Jieun add */
++	unsigned int		stream_id;
+ 	/*
+ 	 * Transaction's current state
+ 	 * [no locking - only kjournald2 alters this]
+@@ -748,7 +750,8 @@ struct journal_s
+ {
+ 	/* General journaling state flags [j_state_lock] */
+ 	unsigned long		j_flags;
+-
++	/* Jieun add */
++	unsigned int		stream_counter;
+ 	/*
+ 	 * Is there an outstanding uncleared error on the journal (from a prior
+ 	 * abort)? [j_state_lock]
+diff --git kernel/x86_64/include/linux/sched.h kernel/x86_64/include/linux/sched.h
+index 6c75fcf..0d4098a 100755
+--- kernel/x86_64/include/linux/sched.h
++++ kernel/x86_64/include/linux/sched.h
+@@ -1451,7 +1451,9 @@ struct task_struct {
+ 	struct epoch *epoch;
+         struct epoch *__epoch;
+ 	unsigned int barrier_fail;
+-	unsigned int epoch_fail;
++	unsigned int epoch_id;
++	/* Jieun add 11_09 */
++	unsigned int stream_id;
+ 	//struct list_head epoch_pending;
+ 	//struct list_head epoch_dispatch;
+ 	//struct list_head epoch_complte;
+diff --git kernel/x86_64/kernel/fork.c kernel/x86_64/kernel/fork.c
+index 6852035..5ecbdf4 100755
+--- kernel/x86_64/kernel/fork.c
++++ kernel/x86_64/kernel/fork.c
+@@ -314,9 +314,11 @@ static struct task_struct *dup_task_struct(struct task_struct *orig)
+ 	tsk->epoch = 0;
+ 	tsk->__epoch = 0;
+ 	tsk->barrier_fail = 0;
+-	tsk->epoch_fail = 0;
+-
++	tsk->epoch_id = 0;
++	
+ 	tsk->stack = ti;
++	
++	tsk->stream_id = 0;
+ 
+ 	setup_thread_stack(tsk, orig);
+ 	clear_user_return_notifier(tsk);
