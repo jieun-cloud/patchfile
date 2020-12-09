@@ -1,0 +1,206 @@
+diff --git kernel/x86_64/block/blk-core.c kernel/x86_64/block/blk-core.c
+index 3ca326a..764b8b3 100755
+--- kernel/x86_64/block/blk-core.c
++++ kernel/x86_64/block/blk-core.c
+@@ -766,7 +766,7 @@ blk_set_epoch_pool(struct request_queue *q)
+ 	mutex_init(&q->epoch_id_lock);
+ 	q->epoch_id = 0;
+ 	q->epoch_complete = false;
+-
++	q->flush_flags |= REQ_FLUSH; //Jieun add 11.26
+ 	return q;
+ }
+ EXPORT_SYMBOL(blk_set_epoch_pool);
+@@ -2019,16 +2019,15 @@ void submit_bio(long long/*int*/ rw, struct bio *bio)
+ 			get_epoch(current->__epoch);
+ 			bio->bi_epoch = current->__epoch;
+ 			bio->bi_epoch->pending++;
+-			mutex_lock(&q->epoch_id_lock);
+-			g_epoch_id = bio->bi_epoch->eid;
+-			mutex_unlock(&q->epoch_id_lock);
++			//mutex_lock(&q->epoch_id_lock);
++			//g_epoch_id = bio->bi_epoch->eid;
++			//mutex_unlock(&q->epoch_id_lock);
+ 
++			bio->bi_epoch->eid = current->epoch_counter;
+ 			if (bio->bi_rw & REQ_BARRIER) {
+ 				blk_finish_epoch();
+ 
+-				mutex_lock(&q->epoch_id_lock);
+-				q->epoch_complete = true;
+-				mutex_unlock(&q->epoch_id_lock);
++			 	current->epoch_counter++;
+ 			}
+ 		}
+ 		/* end */
+@@ -2078,9 +2077,9 @@ void submit_bio64(long long rw, struct bio *bio)
+ 			get_epoch(current->__epoch);
+ 			bio->bi_epoch = current->__epoch;
+ 			bio->bi_epoch->pending++;
+-			mutex_lock(&q->epoch_id_lock);
+-			g_epoch_id = bio->bi_epoch->eid;
+-			mutex_unlock(&q->epoch_id_lock);
++			//mutex_lock(&q->epoch_id_lock);
++			//g_epoch_id = bio->bi_epoch->eid;
++			//mutex_unlock(&q->epoch_id_lock);
+ 
+ 			if (bio->bi_rw & REQ_BARRIER) {
+ 				blk_finish_epoch();
+diff --git kernel/x86_64/drivers/block/nvme-core.c kernel/x86_64/drivers/block/nvme-core.c
+index b5760d7..6b34ba6 100755
+--- kernel/x86_64/drivers/block/nvme-core.c
++++ kernel/x86_64/drivers/block/nvme-core.c
+@@ -760,7 +760,28 @@ static int nvme_submit_bio_queue(struct nvme_queue *nvmeq, struct nvme_ns *ns,
+ static void nvme_make_request(struct request_queue *q, struct bio *bio)
+ {
+ 	struct nvme_ns *ns = q->queuedata;
+-	struct nvme_queue *nvmeq = get_nvmeq(ns->dev);
++	struct nvme_queue *nvmeq;
++	if (bio->bi_rw & REQ_ORDERED){
++		if (current->queue_idx == -1){
++			nvmeq = get_nvmeq(ns->dev);
++			current->queue_idx = get_cpu()+1;
++		}
++		else{
++			
++			nvmeq = ns->dev->queues[current->queue_idx];
++		}
++		if(bio->bi_rw & REQ_BARRIER){
++			current->queue_idx = -1;
++		}		
++
++	}
++	else{
++
++		nvmeq = get_nvmeq(ns->dev);
++	}
++	
++
++
+ 	int result = -EBUSY;
+ 
+ 	spin_lock_irq(&nvmeq->q_lock);
+diff --git kernel/x86_64/drivers/block/virtio_blk.c kernel/x86_64/drivers/block/virtio_blk.c
+index 6472395..d200c33 100755
+--- kernel/x86_64/drivers/block/virtio_blk.c
++++ kernel/x86_64/drivers/block/virtio_blk.c
+@@ -613,7 +613,7 @@ static int virtblk_get_cache_mode(struct virtio_device *vdev)
+ 				&writeback);
+ 	if (err)
+ 		writeback = virtio_has_feature(vdev, VIRTIO_BLK_F_WCE);
+-
++	
+ 	return writeback;
+ }
+ 
+diff --git kernel/x86_64/fs/ext4/inode.c kernel/x86_64/fs/ext4/inode.c
+index a5d4be8..f416321 100755
+--- kernel/x86_64/fs/ext4/inode.c
++++ kernel/x86_64/fs/ext4/inode.c
+@@ -1554,6 +1554,11 @@ static int mpage_da_submit_io(struct mpage_da_data *mpd,
+ 			}
+ 
+ 			clear_page_dirty_for_io(page);
++			// Jieun add 20.11.25
++			// check i value
++			if(mpd->wbc->sync_mode == WB_BARRIER_ALL && i == nr_pages -1){
++				io_submit.io_op = WRITE_BARRIER;
++			}
+ 			err = ext4_bio_write_page(&io_submit, page, len,
+ 						  mpd->wbc);
+ 			if (!err)
+diff --git kernel/x86_64/fs/ext4/page-io.c kernel/x86_64/fs/ext4/page-io.c
+index 112cc5d..2e35550 100755
+--- kernel/x86_64/fs/ext4/page-io.c
++++ kernel/x86_64/fs/ext4/page-io.c
+@@ -340,7 +340,9 @@ static int io_submit_init(struct ext4_io_submit *io,
+ 	io_end->offset = (page->index << PAGE_CACHE_SHIFT) + bh_offset(bh);
+ 
+ 	io->io_bio = bio;
+-	io->io_op = (wbc->sync_mode == WB_SYNC_ALL ?  WRITE_SYNC : WRITE);
++	if(io->io_op != WRITE_BARRIER){
++		io->io_op = (wbc->sync_mode == WB_SYNC_ALL ?  WRITE_SYNC : WRITE);
++	}
+ 	/* UFS */
+ 	
+ 	switch (wbc->sync_mode) {
+@@ -354,10 +356,14 @@ static int io_submit_init(struct ext4_io_submit *io,
+ 		io->io_op = WRITE_ORDERED;
+ 		break;
+ 	case WB_BARRIER_ALL:
+-		io->io_op = WRITE_ORDERED;
++
++		if(io->io_op != WRITE_BARRIER){
++
++			io->io_op = WRITE_ORDERED;
++		}
+ 		break;
+ 	}
+-	
++
+ 	io->io_next_block = bh->b_blocknr;
+ 	return 0;
+ }
+@@ -469,7 +475,7 @@ int ext4_bio_write_page(struct ext4_io_submit *io,
+ 		nr_submitted++;
+ 		clear_buffer_dirty(bh);
+ 	} while ((bh = bh->b_this_page) != head);
+-
++	
+ 	/* Error stopped previous loop? Clean up buffers... */
+ 	if (ret) {
+ 		do {
+diff --git kernel/x86_64/fs/jbd2/revoke.c kernel/x86_64/fs/jbd2/revoke.c
+index 0a078ae..5ebe34a 100755
+--- kernel/x86_64/fs/jbd2/revoke.c
++++ kernel/x86_64/fs/jbd2/revoke.c
+@@ -132,7 +132,7 @@ static void write_one_revoke_record64(journal_t *, transaction_t *,
+ 				struct list_head *,
+ 				struct buffer_head **, int*,
+ 				struct jbd2_revoke_record_s *, long long);
+-static void flush_descriptor64(journal_t *, struct buffer_ehad *, int, long long);
++static void flush_descriptor64(journal_t *, struct buffer_head *, int, long long);
+ #endif
+ 
+ /* Utility functions to maintain the revoke table */
+diff --git kernel/x86_64/include/linux/sched.h kernel/x86_64/include/linux/sched.h
+index 6c75fcf..527e999 100755
+--- kernel/x86_64/include/linux/sched.h
++++ kernel/x86_64/include/linux/sched.h
+@@ -1452,6 +1452,9 @@ struct task_struct {
+         struct epoch *__epoch;
+ 	unsigned int barrier_fail;
+ 	unsigned int epoch_fail;
++	//Jieun add
++	unsigned int epoch_counter;
++	int queue_idx;
+ 	//struct list_head epoch_pending;
+ 	//struct list_head epoch_dispatch;
+ 	//struct list_head epoch_complte;
+diff --git kernel/x86_64/kernel/fork.c kernel/x86_64/kernel/fork.c
+index 6852035..80b4591 100755
+--- kernel/x86_64/kernel/fork.c
++++ kernel/x86_64/kernel/fork.c
+@@ -315,6 +315,9 @@ static struct task_struct *dup_task_struct(struct task_struct *orig)
+ 	tsk->__epoch = 0;
+ 	tsk->barrier_fail = 0;
+ 	tsk->epoch_fail = 0;
++	
++	tsk->epoch_counter = 0;
++	tsk->queue_idx = -1;
+ 
+ 	tsk->stack = ti;
+ 
+diff --git kernel/x86_64/mm/filemap.c kernel/x86_64/mm/filemap.c
+index 20a1f34..580c53f 100755
+--- kernel/x86_64/mm/filemap.c
++++ kernel/x86_64/mm/filemap.c
+@@ -459,7 +459,7 @@ int filemap_write_and_wait_range(struct address_space *mapping,
+ 
+ 	if (mapping->nrpages) {
+ 		err = __filemap_fdatawrite_range(mapping, lstart, lend,
+-						 WB_SYNC_ALL);
++						 WB_BARRIER_ALL); //Jieun add 20.11.25 
+ 		/* See comment of filemap_write_and_wait() */
+ 		if (err != -EIO) {
+ 			int err2 = filemap_fdatawait_range(mapping,
