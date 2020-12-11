@@ -1,0 +1,514 @@
+diff --git CONFIG/ssd.conf CONFIG/ssd.conf
+index c7e144b..8d01574 100644
+--- CONFIG/ssd.conf
++++ CONFIG/ssd.conf
+@@ -1,6 +1,6 @@
+ FILE_NAME_HDA			../../RAMDISK/mnt/ssd_hda.img
+ 
+-N_CORES				3
++N_CORES				2
+ BACKGROUND_GC_ENABLE		0
+ 
+ PAGE_SIZE			16384
+diff --git FIRMWARE/firm_buffer_manager.c FIRMWARE/firm_buffer_manager.c
+index 6e27fe8..285f784 100644
+--- FIRMWARE/firm_buffer_manager.c
++++ FIRMWARE/firm_buffer_manager.c
+@@ -269,6 +269,9 @@ void FIRM_WRITE_EVENT(event_queue_entry* w_entry, bool flush)
+ #endif
+ 		/* Return immediately to the host */
+ 		UPDATE_EVENT_STATE(w_entry, COMPLETED);	
++
++		//Jieun add
++		// Update stream controller
+ 	}
+ 
+ 	/* Wake up the IO thread */
+@@ -696,6 +699,58 @@ event_queue_entry* CREATE_NEW_EVENT(int io_type, uint64_t slba, uint32_t nlb, vo
+ {
+ 	static uint64_t seq_nb = 0;
+ 
++	// Allocate new event entry 
++	event_queue_entry* new_eq_entry = calloc(1, sizeof(event_queue_entry));
++	if(new_eq_entry == NULL){
++		printf("[%s] Allocation new event fail.\n", __FUNCTION__);
++		return NULL;
++	}
++
++	// Allocate sequence number for this event 
++	new_eq_entry->seq_nb = seq_nb;
++	seq_nb++;
++
++	// Initialize new event 
++	new_eq_entry->io_type = io_type;
++	new_eq_entry->valid = VALID;
++	new_eq_entry->sector_nb = slba;
++	new_eq_entry->length = nlb;
++	new_eq_entry->cb = cb;
++	new_eq_entry->opaque = opaque;
++	new_eq_entry->buf = NULL;
++	new_eq_entry->n_child = 0;
++	new_eq_entry->n_completed = 0;
++	new_eq_entry->n_trimmed = 0;
++	new_eq_entry->e_state = WAIT_CHILD;
++	
++	/* Jieun add 20.11.24 */
++	new_eq_entry->stream_id = 0;
++	new_eq_entry->epoch_id = 0;
++	new_eq_entry->barrier_flag = 0;
++
++	pthread_mutex_init(&new_eq_entry->lock, NULL);
++	new_eq_entry->flush = false;
++
++	new_eq_entry->t_start = get_usec();
++	new_eq_entry->n_pages = 0;
++
++	new_eq_entry->prev = NULL;
++	new_eq_entry->next = NULL;
++
++	return new_eq_entry;
++}
++
++
++
++/* Jieun add 20.11.24 
++   This function is for barrier-enabled NVMe FTL 
++   Every event queue entry has stream id, epoch id and barrier flag. 
++   If the request is not a order-preserving write request, the stream id, epoch id, and barrier flag will be zero. 
++   */
++event_queue_entry* CREATE_NEW_EVENT_BARRIER(int io_type, uint64_t slba, uint32_t nlb, void* opaque, CallbackFunc *cb, int stream_id, uint32_t epoch_id, int barrier_flag)
++{
++	static uint64_t seq_nb = 0;
++
+ 	/* Allocate new event entry */
+ 	event_queue_entry* new_eq_entry = calloc(1, sizeof(event_queue_entry));
+ 	if(new_eq_entry == NULL){
+@@ -720,6 +775,12 @@ event_queue_entry* CREATE_NEW_EVENT(int io_type, uint64_t slba, uint32_t nlb, vo
+ 	new_eq_entry->n_trimmed = 0;
+ 	new_eq_entry->e_state = WAIT_CHILD;
+ 
++	/* Jieun add 20.11.24 */
++
++	new_eq_entry->stream_id = stream_id;
++	new_eq_entry->epoch_id = epoch_id;
++	new_eq_entry->barrier_flag = barrier_flag;
++	
+ 	pthread_mutex_init(&new_eq_entry->lock, NULL);
+ 	new_eq_entry->flush = false;
+ 
+@@ -731,7 +792,6 @@ event_queue_entry* CREATE_NEW_EVENT(int io_type, uint64_t slba, uint32_t nlb, vo
+ 
+ 	return new_eq_entry;
+ }
+-
+ /* This function should be called after eq_entry->lock is already held. */
+ void UPDATE_EVENT_STATE(event_queue_entry* eq_entry, enum event_state state)
+ {
+@@ -951,19 +1011,14 @@ void FLUSH_WRITE_BUFFER(int core_id, int w_buf_index)
+ 	cr_entry = cur_w_queue->head;
+ 
+ 	while(n_entries != 0){
+-
+-#ifdef IO_CORE_DEBUG
+-		printf("[%s] core %d: %lu-th event dequeue\n",
+-			__FUNCTION__, core_id, cr_entry->seq_nb);
+-#endif
++		
++		
+ 		/* Write data to Flash memory */
+ 		cr_entry->n_pages = FTL_WRITE(core_id, cr_entry->sector_nb, cr_entry->length);
++		
++		// Update Stream table
++		// Update Tx handler
+ 
+-		/* Get next cr_entry */
+-#ifdef IO_CORE_DEBUG
+-		printf("[%s] core %d: %lu-th event FTL write complete\n",
+-			__FUNCTION__, core_id, cr_entry->seq_nb);
+-#endif
+ 		n_total_pages += cr_entry->n_pages;
+ 
+ 		cr_entry = cr_entry->next;
+diff --git FIRMWARE/firm_buffer_manager.h FIRMWARE/firm_buffer_manager.h
+index abb27bc..25575f9 100644
+--- FIRMWARE/firm_buffer_manager.h
++++ FIRMWARE/firm_buffer_manager.h
+@@ -82,6 +82,11 @@ typedef struct event_queue_entry
+ 	/* Bandwidth */
+ 	int64_t t_start;
+ 	uint32_t n_pages;
++	
++	/* Jieun add 20.11.24 */
++	int stream_id;
++	uint32_t epoch_id;
++	int barrier_flag;
+ 
+ 	/* pointers for candidate queue */
+ 	struct event_queue_entry* prev;
+@@ -105,6 +110,8 @@ event_queue_entry* DEQUEUE_IO(void);
+ /* Manipulate event queue entries */
+ event_queue_entry* CREATE_NEW_EVENT(int io_type, uint64_t slba, 
+ 			uint32_t nlb, void* opaque, CallbackFunc *cb);
++
++event_queue_entry* CREATE_NEW_EVENT_BARRIER(int io_type, uint64_t slba, uint32_t nlb, void* opaque, CallbackFunc *cb, int stream_id, uint32_t epoch_id, int barrier_flag); //Jieun add 20.11.24
+ void UPDATE_EVENT_STATE(event_queue_entry* eq_entry, enum event_state state); 
+ int GET_EVENT_STATE(event_queue_entry* eq_entry); 
+ int GET_N_IO_PAGES(uint64_t sector_nb, uint32_t length);
+diff --git FIRMWARE/ssd.c FIRMWARE/ssd.c
+index 005d8d8..0997c26 100644
+--- FIRMWARE/ssd.c
++++ FIRMWARE/ssd.c
+@@ -51,9 +51,10 @@ event_queue_entry* SSD_NVME_READ(uint64_t slba, uint32_t nlb, NvmeRequest *req,
+ 		void(*cb)(void *opaque, int ret))
+ {
+ 	return SSD_RW(READ, slba, nlb, req, cb);
+-}
+ 
++}
+ 
++/*
+ event_queue_entry* SSD_NVME_WRITE(uint64_t slba, uint32_t nlb, NvmeRequest *req,
+ 		void(*cb)(void *opaque, int ret))
+ {
+@@ -64,6 +65,20 @@ event_queue_entry* SSD_NVME_WRITE(uint64_t slba, uint32_t nlb, NvmeRequest *req,
+ 
+ 	return SSD_RW(WRITE, slba, nlb, req, cb);
+ }
++*/
++
++/* Jieun add 20.11.24 */
++event_queue_entry* SSD_NVME_WRITE_BARRIER(uint64_t slba, uint32_t nlb, NvmeRequest *req,
++		void(*cb)(void *opaque, int ret), int stream_id, uint32_t epoch_id, int barrier_flag)
++{
++	if(nlb > N_WB_SECTORS){
++		printf("ERROR[%s] the size of the write event (%u) exceeds the write buffer (%d), please increase the write buffer size in the ssd configuration \n", __FUNCTION__, nlb, N_WB_SECTORS);
++		return NULL;
++	}
++
++//	return SSD_RW(WRITE, slba, nlb, req, cb);
++	return SSD_RW_BARRIER(WRITE, slba, nlb, req, cb, stream_id, epoch_id, barrier_flag); //Jieun add 20.11.24
++}
+ 
+ 
+ event_queue_entry* SSD_NVME_FLUSH(uint64_t slba, uint32_t nlb, NvmeRequest *req,
+@@ -100,6 +115,25 @@ event_queue_entry* SSD_RW(int io_type, uint64_t slba, uint32_t nlb, void* opaque
+ 	return new_eq_entry;
+ }
+ 
++/* Jieun add 20.11.24 *
++   This function is for barrier-enabled NVMe FTL.
++   SSD_WRITE make a event queue entry which includes stream id, epoch id and barrier flag from Host. */
++event_queue_entry* SSD_RW_BARRIER(int io_type, uint64_t slba, uint32_t nlb, void* opaque, CallbackFunc *cb,  int stream_id, uint32_t epoch_id, int barrier_flag)
++{
++	event_queue_entry* new_eq_entry = NULL;
++
++	/* Create new I/O event */
++	new_eq_entry = CREATE_NEW_EVENT_BARRIER(io_type, slba, nlb, opaque, cb, stream_id, epoch_id, barrier_flag);
++
++	/* Insert new I/O event to the event queue*/
++	ENQUEUE_IO(new_eq_entry);
++
++	/* Wake up the firmware io buffer thread */
++	pthread_cond_signal(&eq_ready);
++
++	return new_eq_entry;
++}
++
+ 
+ void SSD_DSM_DISCARD(NvmeRequest *req, uint32_t nr)
+ {
+diff --git FIRMWARE/ssd.h FIRMWARE/ssd.h
+index ded0310..0285ca4 100644
+--- FIRMWARE/ssd.h
++++ FIRMWARE/ssd.h
+@@ -28,6 +28,12 @@ event_queue_entry* SSD_NVME_FLUSH(uint64_t slba, uint32_t nlb, NvmeRequest *req,
+ 
+ event_queue_entry* SSD_RW(int io_type, uint64_t slba, uint32_t nlb, void* opaque, CallbackFunc *cb);
+ 
++/* Jieun add */
++event_queue_entry* SSD_RW_BARRIER(int io_type, uint64_t slba, uint32_t nlb, void* opaque, CallbackFunc *cb,  int stream_id, uint32_t epoch_id, int barrier_flag);
++event_queue_entry* SSD_NVME_WRITE_BARRIER(uint64_t slba, uint32_t nlb, NvmeRequest *req, void(*cb)(void *opaque, int ret), int stream_id, uint32_t epoch_id, int barrier_flag);
++
++
++
+ /* TRIM command support */
+ void SSD_DSM_DISCARD(NvmeRequest *req, uint32_t nr);
+ int IS_SSD_TRIM_ENABLED(void);
+diff --git FIRMWARE/vssim_core.c FIRMWARE/vssim_core.c
+index 46d86f0..8845455 100644
+--- FIRMWARE/vssim_core.c
++++ FIRMWARE/vssim_core.c
+@@ -19,6 +19,11 @@ pthread_mutex_t* ssd_io_lock;
+ 
+ FILE* fp_gc_info;	
+ 
++/* Jieun add */
++stream_info* stream_table;
++int N_STREAM = 50; //TEMP
++int N_EPOCH = 256; //TEMP
++
+ void MAKE_TIMEOUT(struct timespec *tsp, long timeout_usec)
+ {
+ 	struct timeval now;
+@@ -178,6 +183,7 @@ void INIT_VSSIM_CORE(void)
+ 		pthread_create(&vssim_thread_id[index], NULL, 
+ 					BACKGROUND_GC_THREAD_MAIN_LOOP, NULL);
+ 	}
++
+ }
+ 
+ void INIT_PER_CORE_REQUEST_QUEUE(core_req_queue* cr_queue)
+@@ -309,6 +315,8 @@ void *FIRM_IO_BUF_THREAD_MAIN_LOOP(void *arg)
+ 
+ 		/* Get new IO event */
+ 		cur_entry = DEQUEUE_IO();
++		// Jieun add for debugging
++	//	printf("FIRM_IO_BUF_THREAD_MAIN_LOOP!!! stream_id: %d\t epoch id: %d\t barrier: %d\n", cur_entry->stream_id, cur_entry->epoch_id, cur_entry->barrier_flag);
+ 		
+ 		pthread_mutex_unlock(&eq_lock);
+ 
+@@ -538,12 +546,14 @@ void INSERT_NEW_PER_CORE_REQUEST(int core_id, event_queue_entry* eq_entry,
+ 	/* Create core request entry */
+ 	new_cr_entry = CREATE_NEW_CORE_EVENT(eq_entry, core_id, 
+ 					sector_nb, length, flush);
++	// For debugging
++	printf("Core req entry::: stream_id:%d\t epoch id:%d\t barrier flag:%d\n", new_cr_entry->stream_id, new_cr_entry->epoch_id, new_cr_entry->barrier_flag);
+ 
+ 	if(cur_cr_queue->entry_nb == 0){
+ 		cur_cr_queue->head = new_cr_entry;
+ 		cur_cr_queue->tail = new_cr_entry;
+ 	}
+-	else if(io_type == READ || io_type == WRITE){
++	else if(io_type == READ){
+ 
+ 		/* Check whether this entry can be merged with the last entry */
+ 		if(cur_cr_queue->tail->sector_nb + cur_cr_queue->tail->length
+@@ -814,6 +824,17 @@ core_req_entry* CREATE_NEW_CORE_EVENT(event_queue_entry* eq_entry,
+ 	new_cr_entry->merged_entries.tail = NULL;
+ 	pthread_mutex_init(&new_cr_entry->merged_entries.lock, NULL);
+ 
++	new_cr_entry->stream_id = 0;
++	new_cr_entry->epoch_id = 0;
++	new_cr_entry->barrier_flag = 0;
++	
++	/*Jieun add */
++	if(eq_entry->stream_id !=0){
++		new_cr_entry->stream_id = eq_entry->stream_id;
++		new_cr_entry->epoch_id = eq_entry->epoch_id;
++		new_cr_entry->barrier_flag = eq_entry->barrier_flag;
++	}
++
+ 	return new_cr_entry;
+ }
+ 
+@@ -1112,3 +1133,27 @@ void DECREASE_N_FGGC_PLANES(int core_id)
+ 	pthread_mutex_unlock(&cur_core->n_fggc_lock);
+ }
+ 
++/* Jieun add */
++
++void INIT_CORE_STREAM_TABLE(void)
++{
++	stream_table = (stream_info*)calloc(sizeof(stream_info), N_STREAM);
++	int i;
++	for(i=0; i<N_STREAM; i++){
++		stream_table[i].stream_id = -1;
++		stream_table[i].epoch_table = (epoch_entry*)calloc(sizeof(epoch_entry), N_EPOCH);
++	}
++	int j;
++	for(i=0;i<N_STREAM;i++){
++		struct epoch_entry* cur_epoch_table = stream_table[i].epoch_table;
++		for(j=0;j<N_EPOCH;j++){
++			cur_epoch_table[j].epoch_id = -1;	
++			cur_epoch_table[j].state = INCOMPLETE;	
++			cur_epoch_table[j].mapping_buffer.head = NULL;	
++			cur_epoch_table[j].mapping_buffer.tail = NULL;	
++		}
++	}
++	// For debugging
++	printf("Stream table: stream_table[10] : %d\n", stream_table[10].stream_id);
++	printf("Epoch table: epoch_table[10] : %d\n", stream_table[10].epoch_table[10].epoch_id);
++}
+diff --git FIRMWARE/vssim_core.h FIRMWARE/vssim_core.h
+index 2922939..bdd5e85 100644
+--- FIRMWARE/vssim_core.h
++++ FIRMWARE/vssim_core.h
+@@ -42,6 +42,11 @@ typedef struct core_req_entry
+ 	bool is_trimmed;
+ 
+ 	int64_t t_start; 
++	
++	/* Jieun add */
++	int stream_id;
++	int barrier_flag;
++	uint32_t epoch_id;
+ 
+ 	/* pointer for per-core I/O list */
+ 	struct core_req_entry* next;
+@@ -100,6 +105,43 @@ struct nvme_dsm_range {
+ 	uint64_t	slba;
+ };
+ 
++/* Jieun add */
++typedef struct mapping_entry
++{
++	int lpn;
++	ppn_t ppn;
++	struct mapping_entry* next;
++
++}mapping_entry;
++
++typedef struct mapping_queue
++{
++	struct mapping_entry* head;
++	struct mapping_entry* tail;
++
++}mapping_queue;
++
++enum epoch_state{
++	INCOMPLETE = 0,
++	BARRIER_PASS,
++	BEFORE_WAIR,
++	BARRIER_WAIT,
++};
++
++typedef struct epoch_entry
++{
++	int epoch_id;
++	enum epoch_state state;
++	mapping_queue mapping_buffer; //Linked list
++}epoch_entry;
++
++typedef struct stream_info
++{
++	int stream_id;
++	epoch_entry* epoch_table;
++
++}stream_info;
++
+ void MAKE_TIMEOUT(struct timespec *tsp, long timeout_usec);
+ 
+ /* Initialize vssim core structure */
+@@ -147,4 +189,8 @@ void INCREASE_N_BGGC_PLANES(int core_id);
+ void DECREASE_N_BGGC_PLANES(int core_id);
+ void INCREASE_N_FGGC_PLANES(int core_id);
+ void DECREASE_N_FGGC_PLANES(int core_id);
++
++/* Jieun add */
++void INIT_MAPPING_BUFFER(void);
++void INIT_CORE_STREAM_TABLE(void);
+ #endif
+diff --git FTL/PAGE_MAP/ftl.c FTL/PAGE_MAP/ftl.c
+index 3723a97..83063cc 100644
+--- FTL/PAGE_MAP/ftl.c
++++ FTL/PAGE_MAP/ftl.c
+@@ -39,6 +39,9 @@ void FTL_INIT(void)
+ 		if(ret == -1) goto fail;
+ 
+ 		INIT_VSSIM_CORE();	/* Init Flash -> Init Core */
++		/* Jieun add */
++		INIT_CORE_STREAM_TABLE();
++		printf("Initialize stream table done\n");
+ 
+ 		ret = INIT_MAPPING_TABLE(ret); /* Init Core -> Init Mapping */
+ 		if(ret == -1) goto fail;
+diff --git QEMU/hw/block/nvme.c QEMU/hw/block/nvme.c
+index 7d08f62..d93f04c 100644
+--- QEMU/hw/block/nvme.c
++++ QEMU/hw/block/nvme.c
+@@ -248,6 +248,8 @@ static uint16_t nvme_flush(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+          BLOCK_ACCT_FLUSH);
+ 
+ #ifdef VSSIM_NVME
++	/* Jieun 20.11.16 */
++	printf("\n CMD:FLUSH \n");
+     event_queue_entry* vssim_event = NULL; 
+     vssim_event = SSD_NVME_FLUSH(0, 0, req, nvme_rw_cb);
+ 
+@@ -276,6 +278,12 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+     int is_write = rw->opcode == NVME_CMD_WRITE ? 1 : 0;
+     enum BlockAcctType acct = is_write ? BLOCK_ACCT_WRITE : BLOCK_ACCT_READ;
+ 
++	/* Jieun 20.11.16 */
++	int control = rw->control;
++	uint32_t epoch_id = cmd->res1 >> 32;
++	int stream_id = cmd->res1 & 0xFFFFFFFF;
++	int barrier_flag = (control & (0x1<<9)) >> 9;
++
+ // 08-Jan-2018: Added by Jinsoo Yoo
+ #ifdef VSSIM_NVME
+    event_queue_entry* vssim_event = NULL; 
+@@ -298,11 +306,16 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+ 
+ // 18-Sep-2017: Added by Jinsoo Yoo
+ #ifdef VSSIM_NVME
++	/* Jieun 20.11.06 */
++	printf("Stream id: %d\t Epoch id: %ld\t Barrier: %d\t", stream_id, epoch_id, barrier_flag);
+     if(is_write){
+-        vssim_event = SSD_NVME_WRITE(slba, nlb, req, nvme_rw_cb);
++		printf("CMD: WRITE\n");	
++        //vssim_event = SSD_NVME_WRITE(slba, nlb, req, nvme_rw_cb);
++        vssim_event = SSD_NVME_WRITE_BARRIER(slba, nlb, req, nvme_rw_cb, stream_id, epoch_id, barrier_flag); //Jieun add
+         req->aiocb = dma_blk_write(n->conf.blk, &req->qsg, data_offset, BDRV_SECTOR_SIZE,
+                       nvme_rw_cb, req);
+     }else{
++		printf("CMD: READ\n");
+         vssim_event = SSD_NVME_READ(slba, nlb, req, nvme_rw_cb);
+         req->aiocb = dma_blk_read(n->conf.blk, &req->qsg, data_offset, BDRV_SECTOR_SIZE,
+                      nvme_rw_cb, req);
+diff --git RAMDISK/ram_mount.sh RAMDISK/ram_mount.sh
+index 6728247..6de833f 100755
+--- RAMDISK/ram_mount.sh
++++ RAMDISK/ram_mount.sh
+@@ -7,4 +7,4 @@
+ 
+ mkdir mnt
+ chmod 0755 mnt
+-sudo mount -t tmpfs -o size=16g tmpfs ./mnt
++sudo mount -t tmpfs -o size=40g tmpfs ./mnt
+diff --git vssim_rerun.sh vssim_rerun.sh
+index 17301d8..abaae74 100755
+--- vssim_rerun.sh
++++ vssim_rerun.sh
+@@ -8,7 +8,7 @@
+ #!/bin/bash
+ 
+ MNT="./RAMDISK/mnt"
+-QEMU_RUN_OPTION="-m 2048 -enable-kvm -vga cirrus -device nvme,drive=nvme1,serial=foo"
++QEMU_RUN_OPTION="-m 2048 -enable-kvm -vga cirrus -smp 10 -device nvme,drive=nvme1,serial=foo"
+ QEMU_NETWORK_OPTION="-net nic,model=virtio -net bridge,br=br0"
+ QEMU_IMG1="ssd_hda.img"
+ QEMU_IMG2="ssd_nvme.img"
+@@ -17,7 +17,7 @@ QEMU_DIR="./QEMU/x86_64-softmmu"
+ # Copy backup image
+ cp ./RAMDISK/${QEMU_IMG1} ${MNT}/${QEMU_IMG1}
+ cp ./RAMDISK/${QEMU_IMG2} ${MNT}/${QEMU_IMG2}
+-cp ./META_BK/*.dat ./META/
++#cp ./META_BK/*.dat ./META/
+ 
+ # Run VSSIM
+ sudo ${QEMU_DIR}/qemu-system-x86_64 -hda ${MNT}/${QEMU_IMG1} -hdb ${MNT}/${QEMU_IMG2} -drive file=${MNT}/${QEMU_IMG2},if=none,id=nvme1 ${QEMU_RUN_OPTION} 
+diff --git vssim_run.sh vssim_run.sh
+index d0e610a..08c8b9e 100755
+--- vssim_run.sh
++++ vssim_run.sh
+@@ -8,7 +8,7 @@
+ #!/bin/bash
+ 
+ MNT="./RAMDISK/mnt"
+-QEMU_RUN_OPTION="-m 2048 -enable-kvm -vga cirrus -device nvme,drive=nvme1,serial=foo"
++QEMU_RUN_OPTION="-m 2048 -enable-kvm -smp 10 -vga cirrus -device nvme,drive=nvme1,serial=foo"
+ QEMU_IMG1="ssd_hda.img"
+ QEMU_IMG2="ssd_nvme.img"
+ QEMU_DIR="./QEMU/x86_64-softmmu"
+@@ -19,8 +19,8 @@ OS_IMG="ubuntu-14.04.4-desktop-amd64.iso"
+ sudo rm ./META/*.dat
+ 
+ # Create QEMU disk
+-./QEMU/qemu-img create -f qcow2 ${MNT}/${QEMU_IMG1} 8G
+-./QEMU/qemu-img create -f qcow2 ${MNT}/${QEMU_IMG2} 8G
++./QEMU/qemu-img create -f qcow2 ${MNT}/${QEMU_IMG1} 50G
++./QEMU/qemu-img create -f qcow2 ${MNT}/${QEMU_IMG2} 10G
+ 
+ # Run VSSIM
+ sudo ${QEMU_DIR}/qemu-system-x86_64 -hda ${MNT}/${QEMU_IMG1} -drive file=${MNT}/${QEMU_IMG2},if=none,id=nvme1 -cdrom ${OS_DIR}/${OS_IMG} ${QEMU_RUN_OPTION}
