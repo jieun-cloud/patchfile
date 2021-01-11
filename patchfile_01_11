@@ -1,0 +1,1141 @@
+diff --git CONFIG/ssd.conf CONFIG/ssd.conf
+index c7e144b..8d01574 100644
+--- CONFIG/ssd.conf
++++ CONFIG/ssd.conf
+@@ -1,6 +1,6 @@
+ FILE_NAME_HDA			../../RAMDISK/mnt/ssd_hda.img
+ 
+-N_CORES				3
++N_CORES				2
+ BACKGROUND_GC_ENABLE		0
+ 
+ PAGE_SIZE			16384
+diff --git FIRMWARE/firm_buffer_manager.c FIRMWARE/firm_buffer_manager.c
+index 6e27fe8..d247c56 100644
+--- FIRMWARE/firm_buffer_manager.c
++++ FIRMWARE/firm_buffer_manager.c
+@@ -193,7 +193,7 @@ void FIRM_READ_EVENT(event_queue_entry* r_entry)
+ 	INSERT_TO_CANDIDATE_EVENT_QUEUE(r_entry);
+ 
+ 	/* Insert the current event to the per-core queue */
+-	INSERT_RW_TO_PER_CORE_EVENT_QUEUE(r_entry, -1);
++	INSERT_RW_TO_PER_CORE_EVENT_QUEUE(r_entry, -1,1);
+ 
+ 	/* Wakeup all io threads */
+ 	WAKEUP_ALL_IO_THREADS();
+@@ -255,8 +255,32 @@ void FIRM_WRITE_EVENT(event_queue_entry* w_entry, bool flush)
+ 
+ 	w_entry->flush = flush;
+ 
++	/* Jieun add */
++	bool update=1;	
++	/* Jieun add */
++	enum epoch_state before_state;
++
++	// Search Stream Table & Before epoch state
++	if(w_entry->stream_id){
++		printf("Stream ID: %d\t Epoch ID: %d\t Barrier: %d\n", w_entry->stream_id, w_entry->epoch_id, w_entry->barrier_flag);		
++		//pthread_mutex_lock(&s_table_lock);
++		before_state = SEARCH_BEFORE_EPOCH_STATE(w_entry->stream_id, w_entry->epoch_id);	
++		//pthread_mutex_unlock(&s_table_lock);
++		printf("before state:%d\n", before_state);
++
++		//printf("stream table check:sid %d\n", s_table[w_entry->stream_id % N_STREAM].sid);
++		if(before_state == COMPLETE || before_state == ARRIVED){
++			update = 1;
++		}
++		
++		else{
++			update = 0;
++		}
++	}
++
++
+ 	/* Insert the current event to the per-core queue */
+-	INSERT_RW_TO_PER_CORE_EVENT_QUEUE(w_entry, write_buffer_index);
++	INSERT_RW_TO_PER_CORE_EVENT_QUEUE(w_entry, write_buffer_index, update);
+ 
+ 	if(flush){
+ 		/* Insert the current event to the candidate event queue */
+@@ -268,9 +292,34 @@ void FIRM_WRITE_EVENT(event_queue_entry* w_entry, bool flush)
+ 				__FUNCTION__, w_entry->seq_nb);
+ #endif
+ 		/* Return immediately to the host */
+-		UPDATE_EVENT_STATE(w_entry, COMPLETED);	
++		UPDATE_EVENT_STATE(w_entry, COMPLETED);
++	}
++
++	//post processing 
++	/* Jieun add */
++	if(w_entry->stream_id !=0 && w_entry->barrier_flag){
++		//pthread_mutex_lock(&s_table_lock);
++		if(update){
++			UPDATE_EPOCH_STATE(w_entry->stream_id, w_entry->epoch_id, ARRIVED);
++			printf("Cur State Update: ARRIVED\n");
++			if(TEST_NEXT_VALUE(w_entry->stream_id, w_entry->epoch_id)){
++				printf("Add update info\n");
++				ADD_UPDATE_INFO(w_entry->stream_id, w_entry->epoch_id);
++				if(s_table[w_entry->stream_id % N_STREAM].u_info.valid == 0){
++					INSERT_UPDATE_SID_LIST(w_entry->stream_id);
++				}
++			}
++		}
++		else{
++			UPDATE_EPOCH_STATE(w_entry->stream_id, w_entry->epoch_id, WITHHOLD);
++			printf("Update Next FLAG\n");
++			UPDATE_NEXT_FLAG(w_entry->stream_id, w_entry->epoch_id, 1);	
++			printf("Cur State Update: WITHHOLD\n");
++		}
++		//pthread_mutex_unlock(&s_table_lock);
+ 	}
+ 
++
+ 	/* Wake up the IO thread */
+ 	WAKEUP_ALL_IO_THREADS();
+ }
+@@ -696,6 +745,58 @@ event_queue_entry* CREATE_NEW_EVENT(int io_type, uint64_t slba, uint32_t nlb, vo
+ {
+ 	static uint64_t seq_nb = 0;
+ 
++	// Allocate new event entry 
++	event_queue_entry* new_eq_entry = calloc(1, sizeof(event_queue_entry));
++	if(new_eq_entry == NULL){
++		printf("[%s] Allocation new event fail.\n", __FUNCTION__);
++		return NULL;
++	}
++
++	// Allocate sequence number for this event 
++	new_eq_entry->seq_nb = seq_nb;
++	seq_nb++;
++
++	// Initialize new event 
++	new_eq_entry->io_type = io_type;
++	new_eq_entry->valid = VALID;
++	new_eq_entry->sector_nb = slba;
++	new_eq_entry->length = nlb;
++	new_eq_entry->cb = cb;
++	new_eq_entry->opaque = opaque;
++	new_eq_entry->buf = NULL;
++	new_eq_entry->n_child = 0;
++	new_eq_entry->n_completed = 0;
++	new_eq_entry->n_trimmed = 0;
++	new_eq_entry->e_state = WAIT_CHILD;
++	
++	/* Jieun add 20.11.24 */
++	new_eq_entry->stream_id = 0;
++	new_eq_entry->epoch_id = 0;
++	new_eq_entry->barrier_flag = 0;
++
++	pthread_mutex_init(&new_eq_entry->lock, NULL);
++	new_eq_entry->flush = false;
++
++	new_eq_entry->t_start = get_usec();
++	new_eq_entry->n_pages = 0;
++
++	new_eq_entry->prev = NULL;
++	new_eq_entry->next = NULL;
++
++	return new_eq_entry;
++}
++
++
++
++/* Jieun add 20.11.24 
++   This function is for barrier-enabled NVMe FTL 
++   Every event queue entry has stream id, epoch id and barrier flag. 
++   If the request is not a order-preserving write request, the stream id, epoch id, and barrier flag will be zero. 
++   */
++event_queue_entry* CREATE_NEW_EVENT_BARRIER(int io_type, uint64_t slba, uint32_t nlb, void* opaque, CallbackFunc *cb, int stream_id, uint32_t epoch_id, int barrier_flag)
++{
++	static uint64_t seq_nb = 0;
++
+ 	/* Allocate new event entry */
+ 	event_queue_entry* new_eq_entry = calloc(1, sizeof(event_queue_entry));
+ 	if(new_eq_entry == NULL){
+@@ -720,6 +821,12 @@ event_queue_entry* CREATE_NEW_EVENT(int io_type, uint64_t slba, uint32_t nlb, vo
+ 	new_eq_entry->n_trimmed = 0;
+ 	new_eq_entry->e_state = WAIT_CHILD;
+ 
++	/* Jieun add 20.11.24 */
++
++	new_eq_entry->stream_id = stream_id;
++	new_eq_entry->epoch_id = epoch_id;
++	new_eq_entry->barrier_flag = barrier_flag;
++	
+ 	pthread_mutex_init(&new_eq_entry->lock, NULL);
+ 	new_eq_entry->flush = false;
+ 
+@@ -731,7 +838,6 @@ event_queue_entry* CREATE_NEW_EVENT(int io_type, uint64_t slba, uint32_t nlb, vo
+ 
+ 	return new_eq_entry;
+ }
+-
+ /* This function should be called after eq_entry->lock is already held. */
+ void UPDATE_EVENT_STATE(event_queue_entry* eq_entry, enum event_state state)
+ {
+@@ -942,7 +1048,7 @@ void FLUSH_WRITE_BUFFER(int core_id, int w_buf_index)
+ 	int n_entries = cur_w_queue->entry_nb;
+ 	int n_remain_pages = 0;
+ 	int n_wait_pages = 0;
+-
++	
+ #ifdef DEL_FIRM_OVERHEAD
+ 	bool first_entry = true;
+ 	int64_t remains;
+@@ -957,7 +1063,13 @@ void FLUSH_WRITE_BUFFER(int core_id, int w_buf_index)
+ 			__FUNCTION__, core_id, cr_entry->seq_nb);
+ #endif
+ 		/* Write data to Flash memory */
+-		cr_entry->n_pages = FTL_WRITE(core_id, cr_entry->sector_nb, cr_entry->length);
++		cr_entry->n_pages = FTL_WRITE(core_id, cr_entry->sector_nb, cr_entry->length, cr_entry->stream_id, cr_entry->epoch_id, cr_entry->barrier, cr_entry->update);
++		
++		/* Jieun add */
++		if(cr_entry->barrier){
++			printf("update epoch state\n");
++			UPDATE_EPOCH_STATE(cr_entry->stream_id, cr_entry->epoch_id, COMPLETE);
++		}
+ 
+ 		/* Get next cr_entry */
+ #ifdef IO_CORE_DEBUG
+@@ -1053,6 +1165,7 @@ void FLUSH_WRITE_BUFFER(int core_id, int w_buf_index)
+ }
+ 
+ 
++
+ void INCREASE_RB_FTL_POINTER(uint32_t n_sectors)
+ {
+ 	pthread_mutex_lock(&vssim_r_buf.lock);
+diff --git FIRMWARE/firm_buffer_manager.h FIRMWARE/firm_buffer_manager.h
+index abb27bc..038b9ba 100644
+--- FIRMWARE/firm_buffer_manager.h
++++ FIRMWARE/firm_buffer_manager.h
+@@ -4,7 +4,7 @@
+ // Copyright(c)2017
+ // Hanyang University, Seoul, Korea
+ // Embedded Software Systems Laboratory. All right reserved
+-
++#include "vssim_type.h"
+ #ifndef _FIRM_BUFFER_MANAGER_H_
+ #define _FIRM_BUFFER_MANAGER_H_
+ 
+@@ -16,6 +16,15 @@ extern pthread_mutex_t cq_lock;
+ 
+ typedef void CallbackFunc(void *opaque, int ret);
+ 
++/* Jieun add */
++enum epoch_state{
++	NOT_ARR = 0,
++	ARRIVED,
++	WITHHOLD,
++	COMPLETE,
++};
++
++
+ enum vssim_io_type{
+ 	NOOP = 0,
+ 	READ,
+@@ -82,6 +91,11 @@ typedef struct event_queue_entry
+ 	/* Bandwidth */
+ 	int64_t t_start;
+ 	uint32_t n_pages;
++	
++	/* Jieun add 20.11.24 */
++	int stream_id;
++	uint32_t epoch_id;
++	int barrier_flag;
+ 
+ 	/* pointers for candidate queue */
+ 	struct event_queue_entry* prev;
+@@ -105,6 +119,8 @@ event_queue_entry* DEQUEUE_IO(void);
+ /* Manipulate event queue entries */
+ event_queue_entry* CREATE_NEW_EVENT(int io_type, uint64_t slba, 
+ 			uint32_t nlb, void* opaque, CallbackFunc *cb);
++
++event_queue_entry* CREATE_NEW_EVENT_BARRIER(int io_type, uint64_t slba, uint32_t nlb, void* opaque, CallbackFunc *cb, int stream_id, uint32_t epoch_id, int barrier_flag); //Jieun add 20.11.24
+ void UPDATE_EVENT_STATE(event_queue_entry* eq_entry, enum event_state state); 
+ int GET_EVENT_STATE(event_queue_entry* eq_entry); 
+ int GET_N_IO_PAGES(uint64_t sector_nb, uint32_t length);
+diff --git FIRMWARE/ssd.c FIRMWARE/ssd.c
+index 005d8d8..0997c26 100644
+--- FIRMWARE/ssd.c
++++ FIRMWARE/ssd.c
+@@ -51,9 +51,10 @@ event_queue_entry* SSD_NVME_READ(uint64_t slba, uint32_t nlb, NvmeRequest *req,
+ 		void(*cb)(void *opaque, int ret))
+ {
+ 	return SSD_RW(READ, slba, nlb, req, cb);
+-}
+ 
++}
+ 
++/*
+ event_queue_entry* SSD_NVME_WRITE(uint64_t slba, uint32_t nlb, NvmeRequest *req,
+ 		void(*cb)(void *opaque, int ret))
+ {
+@@ -64,6 +65,20 @@ event_queue_entry* SSD_NVME_WRITE(uint64_t slba, uint32_t nlb, NvmeRequest *req,
+ 
+ 	return SSD_RW(WRITE, slba, nlb, req, cb);
+ }
++*/
++
++/* Jieun add 20.11.24 */
++event_queue_entry* SSD_NVME_WRITE_BARRIER(uint64_t slba, uint32_t nlb, NvmeRequest *req,
++		void(*cb)(void *opaque, int ret), int stream_id, uint32_t epoch_id, int barrier_flag)
++{
++	if(nlb > N_WB_SECTORS){
++		printf("ERROR[%s] the size of the write event (%u) exceeds the write buffer (%d), please increase the write buffer size in the ssd configuration \n", __FUNCTION__, nlb, N_WB_SECTORS);
++		return NULL;
++	}
++
++//	return SSD_RW(WRITE, slba, nlb, req, cb);
++	return SSD_RW_BARRIER(WRITE, slba, nlb, req, cb, stream_id, epoch_id, barrier_flag); //Jieun add 20.11.24
++}
+ 
+ 
+ event_queue_entry* SSD_NVME_FLUSH(uint64_t slba, uint32_t nlb, NvmeRequest *req,
+@@ -100,6 +115,25 @@ event_queue_entry* SSD_RW(int io_type, uint64_t slba, uint32_t nlb, void* opaque
+ 	return new_eq_entry;
+ }
+ 
++/* Jieun add 20.11.24 *
++   This function is for barrier-enabled NVMe FTL.
++   SSD_WRITE make a event queue entry which includes stream id, epoch id and barrier flag from Host. */
++event_queue_entry* SSD_RW_BARRIER(int io_type, uint64_t slba, uint32_t nlb, void* opaque, CallbackFunc *cb,  int stream_id, uint32_t epoch_id, int barrier_flag)
++{
++	event_queue_entry* new_eq_entry = NULL;
++
++	/* Create new I/O event */
++	new_eq_entry = CREATE_NEW_EVENT_BARRIER(io_type, slba, nlb, opaque, cb, stream_id, epoch_id, barrier_flag);
++
++	/* Insert new I/O event to the event queue*/
++	ENQUEUE_IO(new_eq_entry);
++
++	/* Wake up the firmware io buffer thread */
++	pthread_cond_signal(&eq_ready);
++
++	return new_eq_entry;
++}
++
+ 
+ void SSD_DSM_DISCARD(NvmeRequest *req, uint32_t nr)
+ {
+diff --git FIRMWARE/ssd.h FIRMWARE/ssd.h
+index ded0310..0285ca4 100644
+--- FIRMWARE/ssd.h
++++ FIRMWARE/ssd.h
+@@ -28,6 +28,12 @@ event_queue_entry* SSD_NVME_FLUSH(uint64_t slba, uint32_t nlb, NvmeRequest *req,
+ 
+ event_queue_entry* SSD_RW(int io_type, uint64_t slba, uint32_t nlb, void* opaque, CallbackFunc *cb);
+ 
++/* Jieun add */
++event_queue_entry* SSD_RW_BARRIER(int io_type, uint64_t slba, uint32_t nlb, void* opaque, CallbackFunc *cb,  int stream_id, uint32_t epoch_id, int barrier_flag);
++event_queue_entry* SSD_NVME_WRITE_BARRIER(uint64_t slba, uint32_t nlb, NvmeRequest *req, void(*cb)(void *opaque, int ret), int stream_id, uint32_t epoch_id, int barrier_flag);
++
++
++
+ /* TRIM command support */
+ void SSD_DSM_DISCARD(NvmeRequest *req, uint32_t nr);
+ int IS_SSD_TRIM_ENABLED(void);
+diff --git FIRMWARE/vssim_core.c FIRMWARE/vssim_core.c
+index 46d86f0..5d1c738 100644
+--- FIRMWARE/vssim_core.c
++++ FIRMWARE/vssim_core.c
+@@ -17,8 +17,13 @@ pthread_cond_t eq_ready = PTHREAD_COND_INITIALIZER;
+ pthread_cond_t* ssd_io_ready; 
+ pthread_mutex_t* ssd_io_lock;
+ 
++stream_entry* s_table;
++//pthread_mutex_t* s_table_lock;
++update_stream_list* update_sid_list;
++
+ FILE* fp_gc_info;	
+ 
++bool TEST_NEXT_VALUE(uint32_t sid, uint32_t eid);
+ void MAKE_TIMEOUT(struct timespec *tsp, long timeout_usec)
+ {
+ 	struct timeval now;
+@@ -36,6 +41,41 @@ void MAKE_TIMEOUT(struct timespec *tsp, long timeout_usec)
+ 	tsp->tv_nsec = t_usec * 1000;
+ }
+ 
++/* Jieun add */
++void INIT_STREAM_TABLE(void)
++{
++	s_table = (stream_entry*)calloc(sizeof(stream_entry), N_STREAM);
++	//s_table_lock = (pthread_mutex_t*)calloc(sizeof(pthread_mutex_t), 1);
++	//pthread_mutex_init(&s_table_lock, NULL);
++	update_sid_list = (update_stream_list*)calloc(sizeof(update_stream_list), 1);
++	update_sid_list->head = NULL;
++	update_sid_list->tail = NULL;
++	update_sid_list->entry_nb = 0;
++
++	int i, j;
++	for(i=0;i<N_STREAM;i++){
++		s_table[i].e_table = (epoch_entry*)calloc(sizeof(epoch_entry), N_EPOCH);
++		s_table[i].sid = -1;
++		s_table[i].u_info.valid = 0;
++		s_table[i].u_info.max = -1;
++
++		//pthread_mutex_init(&s_table[i].lock, NULL);
++		//&s_table[i].wh_queue = (withhold_queue*)calloc(sizeof(withhold_queue), 1);
++		s_table[i].wh_queue.head = NULL;
++		s_table[i].wh_queue.tail = NULL;
++		s_table[i].wh_queue.entry_nb = 0;
++	}
++
++	for(i=0;i<N_STREAM;i++){
++		for(j=0;j<N_EPOCH;j++){
++			s_table[i].e_table[j].eid = -1;
++			s_table[i].e_table[j].state = NOT_ARR;
++			s_table[i].e_table[j].next = 0;
++		}
++	}
++}
++
++
+ void INIT_VSSIM_CORE(void)
+ {
+ 	int i, j;
+@@ -62,7 +102,6 @@ void INIT_VSSIM_CORE(void)
+ 		for(i=0; i<N_IO_CORES; i++){
+ 			/* Init read queue */
+ 			INIT_PER_CORE_REQUEST_QUEUE(&vs_core[i].read_queue);
+-
+ 			/* Create write queue */
+ 			vs_core[i].write_queue =
+ 				(core_req_queue*)calloc(sizeof(core_req_queue), N_WRITE_BUF);
+@@ -78,7 +117,8 @@ void INIT_VSSIM_CORE(void)
+ 
+ 			/* Init discard queue */
+ 			INIT_PER_CORE_REQUEST_QUEUE(&vs_core[i].discard_queue);
+-
++			
++			
+ 			/* Init flash list */
+ 			INIT_FLASH_LIST(i);
+ 			vs_core[i].flash_index = i;
+@@ -282,6 +322,223 @@ void TERM_VSSIM_CORE(void)
+ #endif
+ }
+ 
++/* Jieun add */
++void ADD_UPDATE_INFO(uint32_t sid, uint32_t eid, int core_id){
++	// Calculate maximum epoch id
++	uint32_t i = eid;
++	while(!TEST_NEXT_VALUE(sid, i)){
++		i++; //last barrier-arrived eid
++	}
++
++	int max_eid = i+1;
++
++	if(s_table[sid % N_STREAM].u_info.max < max_eid){
++		s_table[sid % N_STREAM].u_info.max = max_eid;
++	}
++
++	printf("max update eid: %d\n", s_table[sid % N_STREAM].u_info.max);
++}
++
++/* Jieun add */
++void INSERT_UPDATE_SID_LIST(uint32_t stream_id){
++	printf("Insert update sid list\n");
++	/* Create new update sid list entry*/
++	update_sid_entry* new_entry = (update_sid_entry*)calloc(sizeof(update_sid_entry),1);
++	new_entry->stream_id = stream_id;
++	if(update_sid_list->entry_nb == 0){
++		update_sid_list->head = new_entry;
++		update_sid_list->tail = new_entry;
++	}
++	else{
++		update_sid_list->tail->next = new_entry;
++		update_sid_list->tail = new_entry;
++	}
++	s_table[stream_id % N_STREAM].u_info.valid = 1;
++}
++
++void UPDATE_NEXT_FLAG(uint32_t sid, uint32_t eid, bool next){
++	// Update before epoch's next flag to true
++	if(eid !=0){
++		s_table[ sid% N_STREAM].e_table[(eid-1) %N_EPOCH].next = next;
++	}
++}
++
++bool TEST_NEXT_VALUE(uint32_t sid, uint32_t eid){
++	return s_table[sid % N_STREAM].e_table[eid % N_EPOCH].next;
++}
++
++/* Jieun add */
++enum epoch_state SEARCH_BEFORE_EPOCH_STATE(uint32_t sid, uint32_t eid){
++	
++	uint32_t s_index = sid % N_STREAM;
++	if(s_table[s_index].sid != sid){
++		s_table[s_index].sid = sid;
++		//first access
++		if(eid == 0){
++			return COMPLETE;
++		}
++		else{
++			return NOT_ARR;
++		}	
++	}
++
++	if(eid == 0){
++		return COMPLETE;
++	}
++
++	uint32_t e_index = eid % N_EPOCH;
++	epoch_entry* cur_e_table = s_table[s_index].e_table;
++	int b_index = e_index-1;
++	if(b_index < 0){
++		b_index = 0;
++	}
++	enum epoch_state before_state = cur_e_table[b_index].state;
++
++	return before_state;	
++}
++
++/* Jieun add */
++void UPDATE_EPOCH_STATE(uint32_t sid, uint32_t eid, enum epoch_state state){
++	uint32_t sidx = sid % N_STREAM;
++	uint32_t eidx = eid % N_EPOCH;
++
++	s_table[sidx].e_table[eidx].state = state;
++}
++
++/* Jieun add */
++withhold_entry* CREATE_NEW_WITHHOLD_ENTRY(uint32_t stream_id, uint32_t epoch_id, int lpn, ppn_t ppn, int barrier, int core_id){
++	withhold_entry* new_wh_entry = (withhold_entry*)calloc(sizeof(withhold_entry), 1);
++	if(new_wh_entry == NULL){
++		printf("NEW withhold entry failed\n");
++	}
++	new_wh_entry->prev = NULL;
++	new_wh_entry->next = NULL;
++	new_wh_entry->barrier = barrier;
++	new_wh_entry->lpn = lpn;
++	new_wh_entry->ppn = ppn;
++	new_wh_entry->epoch_id = epoch_id;
++	new_wh_entry->stream_id = stream_id;
++	new_wh_entry->core_id = core_id;
++	return new_wh_entry;
++}
++
++/* Jieun add */
++void INSERT_PER_STREAM_WITHHOLD_QUEUE(uint32_t stream_id, uint32_t epoch_id, int lpn, ppn_t ppn, int barrier, int core_id){
++	printf("INSERT WITHHOLD QUEUE\n");
++	//Sort withhold queue with epoch id ascending order
++	withhold_queue* cur_queue = NULL;
++	cur_queue = &s_table[stream_id % N_STREAM].wh_queue;
++	withhold_entry* wh_entry = CREATE_NEW_WITHHOLD_ENTRY(stream_id, epoch_id, lpn, ppn, barrier, core_id);
++
++	if(cur_queue->entry_nb == 0){
++		printf("entry nb 0\n");
++		cur_queue->head = wh_entry;
++		cur_queue->tail = wh_entry;
++	}
++	else{
++		/*
++		withhold_entry* temp = cur_queue->head;
++		while(temp->epoch_id > wh_entry->epoch_id && temp != cur_queue->tail){
++			temp = temp->next;
++		}
++		if(temp == cur_queue->tail){
++			cur_queue->tail->next = wh_entry;
++			wh_entry->prev = cur_queue->tail;
++			cur_queue->tail = wh_entry;
++		}
++		else{
++			wh_entry->next = temp->next;
++			wh_entry->prev = temp;
++			temp->next->prev = wh_entry; 
++			temp->next = wh_entry;
++		}*/
++		if(cur_queue->tail == NULL){
++			printf("Null\n");
++		}
++		cur_queue->tail->next = wh_entry;
++		printf("next pointer update\n");
++		//wh_entry->prev = cur_queue->tail;
++		//printf("prev pointer update\n");
++		cur_queue->tail = wh_entry;
++		printf("Finish to insert\n");
++	}
++	cur_queue->entry_nb++;
++	printf("cur wh queue entry nb: %d\n", cur_queue->entry_nb);
++}
++
++/* Jieun add */
++void POP_UPDATE_SID_LIST(void){
++	//Pop head of the list
++	update_sid_entry* cur_entry = update_sid_list->head;
++
++	if(update_sid_list->entry_nb == 1){
++		update_sid_list->head = NULL;
++		update_sid_list->tail = NULL;
++	}
++	else{
++		update_sid_list->head = cur_entry->next;
++	}
++	free(cur_entry);
++	update_sid_list->entry_nb--;
++}
++
++/* Jieun add */
++void POP_WITHHOLD_HEAD_ENTRY(withhold_queue* cur_wh_queue){
++	withhold_entry* cur_wh_entry = cur_wh_queue->head;
++	if(cur_wh_queue->entry_nb == 1){
++		cur_wh_queue->head = NULL;
++		cur_wh_queue->tail = NULL;
++	}
++	else{
++		cur_wh_queue->head = cur_wh_entry->next;
++		cur_wh_entry->next->prev = NULL;
++	}
++	free(cur_wh_entry);
++	cur_wh_queue->entry_nb--;
++}
++
++/* Jieun add */
++void UPDATE_WITHHOLD_QUEUE(uint32_t stream_id, int max_eid){
++	printf("Update stream %d's withhold queue\n", stream_id);
++	withhold_queue* cur_wh_queue = &s_table[stream_id % N_STREAM].wh_queue;
++	withhold_entry* cur_wh_entry = NULL;	
++	int barrier;
++	int cur_eid;
++	cur_wh_entry = cur_wh_queue->head;
++	cur_eid = cur_wh_entry->epoch_id;
++
++	while(cur_wh_entry != NULL && cur_eid <= max_eid){
++		UPDATE_MAPPING_INFO(cur_wh_entry->core_id, cur_wh_entry->lpn, cur_wh_entry->ppn);
++		if(cur_wh_entry->barrier){
++			UPDATE_EPOCH_STATE(stream_id, cur_wh_entry->epoch_id, COMPLETE);
++			UPDATE_NEXT_FLAG(stream_id, cur_wh_entry->epoch_id, 0);
++		}
++		cur_wh_entry = cur_wh_entry->next;
++		POP_WITHHOLD_HEAD_ENTRY(cur_wh_queue);
++	}
++}
++/* Jieun add */
++void FLUSH_POST_PROCESS(void){
++	uint32_t stream_id;
++	int max_eid;
++	printf("POST Processing\n");
++	update_sid_entry* cur_entry = NULL;
++	cur_entry = update_sid_list->head;
++	while(cur_entry!=NULL){
++		//stream_id = POP_UPDATE_SID_LIST();
++		//Access to per stream update epoch info
++		stream_id = cur_entry->stream_id;
++		max_eid = s_table[stream_id % N_STREAM].u_info.max;
++		printf("Max EID: %d\n", max_eid);
++
++		UPDATE_WITHHOLD_QUEUE(stream_id, max_eid);
++		//Initialize stream info
++		s_table[stream_id % N_STREAM].u_info.max = -1;
++		s_table[stream_id % N_STREAM].u_info.valid = 0;
++		cur_entry = cur_entry->next;
++		POP_UPDATE_SID_LIST();
++	}
++}
+ 
+ void *FIRM_IO_BUF_THREAD_MAIN_LOOP(void *arg)
+ {
+@@ -309,6 +566,8 @@ void *FIRM_IO_BUF_THREAD_MAIN_LOOP(void *arg)
+ 
+ 		/* Get new IO event */
+ 		cur_entry = DEQUEUE_IO();
++		// Jieun add for debugging
++	//	printf("FIRM_IO_BUF_THREAD_MAIN_LOOP!!! stream_id: %d\t epoch id: %d\t barrier: %d\n", cur_entry->stream_id, cur_entry->epoch_id, cur_entry->barrier_flag);
+ 		
+ 		pthread_mutex_unlock(&eq_lock);
+ 
+@@ -364,9 +623,10 @@ void *SSD_IO_THREAD_MAIN_LOOP(void *arg)
+ 			DO_PER_CORE_DISCARD(core_id);
+ 		}
+ 		else if(TEST_FLUSH_FLAG(core_id)){
+-
++			printf("FLUSH COMMAND\n");
+ 			pthread_mutex_lock(&vs_core[core_id].flush_lock);
+ 
++			//pthread_mutex_lock(&s_table_lock); //Jieun add
+ 			/* Flush all write buffers */
+ 			for(i=0; i<N_WRITE_BUF; i++){
+ 				pthread_mutex_lock(&vssim_w_buf[i].lock);
+@@ -378,11 +638,13 @@ void *SSD_IO_THREAD_MAIN_LOOP(void *arg)
+ 					continue;
+ 				}
+ 				pthread_mutex_unlock(&vssim_w_buf[i].lock);
+-
++				
+ 				FLUSH_WRITE_BUFFER(core_id, i);
+ 			}
+ 		
+ 			END_PER_CORE_FLUSH_REQUEST(core_id);
++			//FLUSH_POST_PROCESS();
++			//pthread_mutex_unlock(&s_table_lock); //Jieun add
+ 
+ #ifdef IO_CORE_DEBUG
+ 			printf("[%s] %ld core: flush all write buffer\n",
+@@ -395,6 +657,8 @@ void *SSD_IO_THREAD_MAIN_LOOP(void *arg)
+ 		}
+ 		else if(GET_WRITE_BUFFER_TO_FLUSH(core_id, &w_buf_index) == SUCCESS){
+  
++			printf("Time to FLUSH\n");
++			//pthread_mutex_lock(&s_table_lock); //Jieun add
+ 			/* Write data from write buffer to Flash */
+ 			FLUSH_WRITE_BUFFER(core_id, w_buf_index);
+ 
+@@ -402,6 +666,9 @@ void *SSD_IO_THREAD_MAIN_LOOP(void *arg)
+ 			if(w_buf_index == N_WRITE_BUF){
+ 				w_buf_index = 0;
+ 			}
++			//post processing
++			//FLUSH_POST_PROCESS();
++			//pthread_mutex_unlock(&s_table_lock); //Jieun add
+ 		}
+ 		else{
+ #ifdef IO_CORE_DEBUG
+@@ -507,15 +774,20 @@ void MERGE_CORE_REQ_ENTRY(core_req_entry* dst_entry, core_req_entry* src_entry)
+ 	dst_entry->merged_entries.entry_nb++;
+ }
+ 
++/* Jieun add*/
++//void INSERT_REQ_ENTRY_WITTHOLD_QUEUE(core_req_entry* cr_entry){
++
++//}
+ void INSERT_NEW_PER_CORE_REQUEST(int core_id, event_queue_entry* eq_entry, 
+-			uint64_t sector_nb, uint32_t length, int w_buf_index)
++			uint64_t sector_nb, uint32_t length, int w_buf_index, bool update)
+ {
+ 	enum vssim_io_type io_type = eq_entry->io_type;
+ 	bool flush = eq_entry->flush;
+ 
+ 	core_req_entry* new_cr_entry = NULL;
+ 	core_req_queue* cur_cr_queue = NULL;	
+-
++	
++	
+ 	/* Get per-core request queue */
+ 	if(io_type == WRITE){
+ 		cur_cr_queue = &vs_core[core_id].write_queue[w_buf_index];
+@@ -532,23 +804,32 @@ void INSERT_NEW_PER_CORE_REQUEST(int core_id, event_queue_entry* eq_entry,
+ 		return;
+ 	}
+ 
++
+ 	/* Acquire lock for per-core request queue */
+ 	pthread_mutex_lock(&cur_cr_queue->lock);
+ 
++
+ 	/* Create core request entry */
+ 	new_cr_entry = CREATE_NEW_CORE_EVENT(eq_entry, core_id, 
+-					sector_nb, length, flush);
++					sector_nb, length, flush, update);
++	/* Jieun add */
++	if(eq_entry->stream_id){
++		new_cr_entry->stream_id = eq_entry->stream_id;
++		new_cr_entry->epoch_id = eq_entry->epoch_id;
++		new_cr_entry->barrier = eq_entry->barrier_flag;
++			
++	}
+ 
+ 	if(cur_cr_queue->entry_nb == 0){
+ 		cur_cr_queue->head = new_cr_entry;
+ 		cur_cr_queue->tail = new_cr_entry;
+ 	}
+ 	else if(io_type == READ || io_type == WRITE){
+-
++		
+ 		/* Check whether this entry can be merged with the last entry */
+ 		if(cur_cr_queue->tail->sector_nb + cur_cr_queue->tail->length
+ 				== new_cr_entry->sector_nb
+-				&& cur_cr_queue->tail->io_type == new_cr_entry->io_type){
++				&& cur_cr_queue->tail->io_type == new_cr_entry->io_type && cur_cr_queue->tail->update && update){
+ 
+ 			MERGE_CORE_REQ_ENTRY(cur_cr_queue->tail, new_cr_entry);
+ 
+@@ -575,7 +856,7 @@ exit:
+ /*
+  * For the read event, w_buf_index should be -1.
+  */
+-void INSERT_RW_TO_PER_CORE_EVENT_QUEUE(event_queue_entry* eq_entry, int w_buf_index)
++void INSERT_RW_TO_PER_CORE_EVENT_QUEUE(event_queue_entry* eq_entry, int w_buf_index, bool update)
+ {
+ 	int i;
+ 	int core_id;
+@@ -661,7 +942,7 @@ void INSERT_RW_TO_PER_CORE_EVENT_QUEUE(event_queue_entry* eq_entry, int w_buf_in
+ 		if(per_core_io_flag[i]){
+ 			/* Insert new per core request to the per core queue */
+ 			INSERT_NEW_PER_CORE_REQUEST(i, eq_entry,
+-					per_core_sector_nb[i], per_core_length[i], w_buf_index);
++					per_core_sector_nb[i], per_core_length[i], w_buf_index, update);
+ 
+ 		}
+ 	}
+@@ -753,7 +1034,7 @@ void INSERT_DISCARD_TO_PER_CORE_EVENT_QUEUE(event_queue_entry* eq_entry)
+ 			if(per_core_io_flag[j]){
+ 				/* Insert new per core request to the per core queue */
+ 				INSERT_NEW_PER_CORE_REQUEST(j, eq_entry,
+-						per_core_sector_nb[j], per_core_length[j], -1);
++						per_core_sector_nb[j], per_core_length[j], -1, 1);
+ 			}
+ 		}
+ 	}
+@@ -786,7 +1067,7 @@ void INSERT_FLUSH_TO_PER_CORE_EVENT_QUEUE(event_queue_entry* eq_entry)
+ 
+ 
+ core_req_entry* CREATE_NEW_CORE_EVENT(event_queue_entry* eq_entry, 
+-		int core_id, uint64_t sector_nb, uint32_t length, bool flush)
++		int core_id, uint64_t sector_nb, uint32_t length, bool flush, bool update)
+ {
+ 	core_req_entry* new_cr_entry = (core_req_entry*)calloc(1, sizeof(core_req_entry));
+ 	if(new_cr_entry == NULL){
+@@ -814,6 +1095,12 @@ core_req_entry* CREATE_NEW_CORE_EVENT(event_queue_entry* eq_entry,
+ 	new_cr_entry->merged_entries.tail = NULL;
+ 	pthread_mutex_init(&new_cr_entry->merged_entries.lock, NULL);
+ 
++	/* Jieun add */
++	new_cr_entry->stream_id = 0;
++	new_cr_entry->epoch_id = 0;
++	new_cr_entry->barrier = 0;
++	new_cr_entry->update = update;
++	
+ 	return new_cr_entry;
+ }
+ 
+diff --git FIRMWARE/vssim_core.h FIRMWARE/vssim_core.h
+index 2922939..18a51a8 100644
+--- FIRMWARE/vssim_core.h
++++ FIRMWARE/vssim_core.h
+@@ -15,8 +15,34 @@ extern FILE* fp_gc_info;
+ 
+ extern pthread_cond_t* ssd_io_ready;
+ 
++/* Jieun add */
++extern pthread_mutex_t* s_table_lock;
++
++/* Jieun add */
++#define N_STREAM 100
++#define N_EPOCH 255
++
++
+ typedef void CallbackFunc(void *opaque, int ret);
+ 
++/* Jieun add */
++typedef struct{
++	uint32_t sid;
++	int eid;
++	int barrier;
++	int lpn;
++	ppn_t ppn;
++	struct mapping_entry* prev;
++	struct mapping_entry* next;
++}mapping_entry;
++
++
++/* jieun add */
++typedef struct{
++	mapping_entry* head;
++	mapping_entry* tail;
++	int n_entry;
++}mapping_queue;
+ 
+ typedef struct core_req_queue
+ {
+@@ -51,6 +77,12 @@ typedef struct core_req_entry
+ 
+ 	/* list for merged entries */
+ 	core_req_queue merged_entries;
++	
++	/* Jieun add */
++	uint32_t stream_id;
++	int barrier;
++	uint32_t epoch_id;
++	bool update;
+ 
+ }core_req_entry;
+ 
+@@ -100,6 +132,58 @@ struct nvme_dsm_range {
+ 	uint64_t	slba;
+ };
+ 
++/* Jieun add */
++typedef struct epoch_entry{
++	int eid;
++	enum epoch_state state;
++	bool next;
++}epoch_entry;
++
++
++typedef struct update_info{
++	bool valid;
++	int max;
++}update_info;
++
++typedef struct withhold_entry{
++	struct withhold_entry* prev;
++	struct withhold_entry* next;
++	ppn_t ppn;
++	int lpn;
++	int barrier;
++	uint32_t stream_id;
++	uint32_t epoch_id;
++	int core_id;
++}withhold_entry;
++
++typedef struct{
++	int entry_nb;
++	struct withhold_entry* head;
++	struct withhold_entry* tail;
++}withhold_queue;
++
++typedef struct stream_entry{
++	int sid;
++	epoch_entry* e_table;
++	update_info u_info;
++	withhold_queue wh_queue;
++}stream_entry;
++
++typedef struct update_sid_entry{
++	uint32_t stream_id;
++	struct update_sid_entry* next;
++
++}update_sid_entry;
++
++typedef struct{
++	int entry_nb;
++	struct update_sid_entry* head;
++	struct update_sid_entry* tail;
++}update_stream_list;
++
++extern stream_entry* s_table;
++extern update_stream_list* update_sid_list;
++
+ void MAKE_TIMEOUT(struct timespec *tsp, long timeout_usec);
+ 
+ /* Initialize vssim core structure */
+@@ -119,16 +203,16 @@ void *BACKGROUND_GC_THREAD_MAIN_LOOP(void *arg);
+ int64_t GET_LOCAL_LPN(int64_t lpn, int* core_id);
+ void MERGE_CORE_REQ_ENTRY(core_req_entry* dst_entry, core_req_entry* src_entry);
+ void INSERT_NEW_PER_CORE_REQUEST(int core_id, event_queue_entry* eq_entry, 
+-			uint64_t sector_nb, uint32_t length, int w_buf_index);
++			uint64_t sector_nb, uint32_t length, int w_buf_index, bool update);
+ void INSERT_RW_TO_PER_CORE_EVENT_QUEUE(event_queue_entry* eq_entry, 
+-							int w_buf_index);
++							int w_buf_index, bool update);
+ void INSERT_DISCARD_TO_PER_CORE_EVENT_QUEUE(event_queue_entry* eq_entry);
+ void INSERT_FLUSH_TO_PER_CORE_EVENT_QUEUE(event_queue_entry* eq_entry);
+ 
+ /* IO Event Processing */
+ core_req_entry* GET_PER_CORE_EVENT(int core_id);
+ core_req_entry* CREATE_NEW_CORE_EVENT(event_queue_entry* eq_entry, int core_id, 
+-		uint64_t sector_nb, uint32_t length, bool flush);
++		uint64_t sector_nb, uint32_t length, bool flush, bool update);
+ void WAKEUP_ALL_IO_THREADS(void);
+ 
+ /* IO Post Processing */
+@@ -147,4 +231,7 @@ void INCREASE_N_BGGC_PLANES(int core_id);
+ void DECREASE_N_BGGC_PLANES(int core_id);
+ void INCREASE_N_FGGC_PLANES(int core_id);
+ void DECREASE_N_FGGC_PLANES(int core_id);
++
++//Jieun add
++void INIT_STREAM_TABLE(void);
+ #endif
+diff --git FTL/PAGE_MAP/ftl.c FTL/PAGE_MAP/ftl.c
+index 3723a97..5020f5a 100644
+--- FTL/PAGE_MAP/ftl.c
++++ FTL/PAGE_MAP/ftl.c
+@@ -39,6 +39,11 @@ void FTL_INIT(void)
+ 		if(ret == -1) goto fail;
+ 
+ 		INIT_VSSIM_CORE();	/* Init Flash -> Init Core */
++		
++		INIT_STREAM_TABLE(); //Jieun add
++		//jieun add
++		printf("Stream table initialize done\n");
++
+ 
+ 		ret = INIT_MAPPING_TABLE(ret); /* Init Core -> Init Mapping */
+ 		if(ret == -1) goto fail;
+@@ -141,11 +146,11 @@ int FTL_READ(int core_id, uint64_t sector_nb, uint32_t length)
+ 	return ret;
+ }
+ 
+-int FTL_WRITE(int core_id, uint64_t sector_nb, uint32_t length)
++int FTL_WRITE(int core_id, uint64_t sector_nb, uint32_t length, uint32_t stream_id, uint32_t epoch_id, int barrier, bool update)
+ {
+ 	int n_pages;
+ 
+-	n_pages = _FTL_WRITE(core_id, sector_nb, length);
++	n_pages = _FTL_WRITE(core_id, sector_nb, length, stream_id, epoch_id, barrier, update);
+ 	if(n_pages == -1)
+ 		printf("ERROR[%s] _FTL_WRITE function returns FAIL\n", __FUNCTION__);		
+ 
+@@ -315,7 +320,7 @@ int _FTL_READ(int core_id, uint64_t sector_nb, uint32_t length)
+ 	return SUCCESS;
+ }
+ 
+-int _FTL_WRITE(int core_id, uint64_t sector_nb, uint32_t length)
++int _FTL_WRITE(int core_id, uint64_t sector_nb, uint32_t length, uint32_t stream_id, uint32_t epoch_id, int barrier, bool update)
+ {
+ #ifdef FTL_DEBUG
+ 	printf("[%s] %d core: Start write %lu sector, %u length\n", 
+@@ -369,22 +374,31 @@ int _FTL_WRITE(int core_id, uint64_t sector_nb, uint32_t length)
+ 
+ 		lpn = lba / (int64_t)SECTORS_PER_PAGE;
+ 		old_ppn = GET_MAPPING_INFO(core_id, lpn);
++		if(update || stream_id == 0){
++			if((left_skip || right_skip) && (old_ppn.addr != -1)){
++				// TEMP
++				//			FLASH_PAGE_READ(core_id, old_ppn);
++				//			WAIT_FLASH_IO(core_id, 1);
+ 
+-		if((left_skip || right_skip) && (old_ppn.addr != -1)){
+-// TEMP
+-//			FLASH_PAGE_READ(core_id, old_ppn);
+-//			WAIT_FLASH_IO(core_id, 1);
++				FLASH_PAGE_WRITE(core_id, new_ppn);
+ 
+-			FLASH_PAGE_WRITE(core_id, new_ppn);
++				PARTIAL_UPDATE_PAGE_MAPPING(core_id, core_id, lpn, new_ppn, \
++						old_ppn, left_skip, right_skip);
++			}
++			else{
++				ret = FLASH_PAGE_WRITE(core_id, new_ppn);
+ 
+-			PARTIAL_UPDATE_PAGE_MAPPING(core_id, core_id, lpn, new_ppn, \
+-					old_ppn, left_skip, right_skip);
++				UPDATE_OLD_PAGE_MAPPING(core_id, core_id, lpn);
++				UPDATE_NEW_PAGE_MAPPING(core_id, lpn, new_ppn);
++			}
+ 		}
+ 		else{
++			// withhold flag
++			// Insert mapping info to
++			printf("FTL WRITE Withhold Phase:: SID:%d\t EID:%d\t BARRIER:%d\n", stream_id, epoch_id, barrier);
+ 			ret = FLASH_PAGE_WRITE(core_id, new_ppn);
+-
+-			UPDATE_OLD_PAGE_MAPPING(core_id, core_id, lpn);
+-			UPDATE_NEW_PAGE_MAPPING(core_id, lpn, new_ppn);
++			INSERT_PER_STREAM_WITHHOLD_QUEUE(stream_id, epoch_id, lpn, new_ppn, barrier, core_id);
++			printf("END INSERT to withhold queue\n");
+ 		}
+ 
+ 		n_write_pages++;
+@@ -403,3 +417,10 @@ int _FTL_WRITE(int core_id, uint64_t sector_nb, uint32_t length)
+ #endif
+ 	return n_write_pages;
+ }
++
++/* Jieun add */
++void UPDATE_MAPPING_INFO(int core_id, int lpn, ppn_t ppn){
++
++	UPDATE_OLD_PAGE_MAPPING(core_id, core_id, lpn);
++	UPDATE_NEW_PAGE_MAPPING(core_id, lpn, ppn);
++}
+diff --git FTL/PAGE_MAP/ftl.h FTL/PAGE_MAP/ftl.h
+index 42f42c3..e60cdc6 100644
+--- FTL/PAGE_MAP/ftl.h
++++ FTL/PAGE_MAP/ftl.h
+@@ -9,7 +9,7 @@
+ #define _FTL_H_
+ 
+ #include "common.h"
+-
++#include "stdbool.h"
+ extern FILE* fp_w_event;
+ extern FILE* fp_ch_util;
+ extern FILE* fp_wb_lat;
+@@ -19,9 +19,10 @@ void FTL_INIT(void);
+ void FTL_TERM(void);
+ 
+ int FTL_READ(int core_id, uint64_t sector_nb, uint32_t length);
+-int FTL_WRITE(int core_id, uint64_t sector_nb, uint32_t length);
++int FTL_WRITE(int core_id, uint64_t sector_nb, uint32_t length, uint32_t stream_id, uint32_t epoch_id, int barrier, bool update);
+ void FTL_DISCARD(int core_id, uint64_t sector_nb, uint32_t length);
+ 
+ int _FTL_READ(int core_id, uint64_t sector_nb, uint32_t length);
+-int _FTL_WRITE(int core_id, uint64_t sector_nb, uint32_t length);
++int _FTL_WRITE(int core_id, uint64_t sector_nb, uint32_t length, uint32_t stream_id, uint32_t epoch_id, int barrier, bool update);
++void UPDATE_MAPPING_INFO(int core_id, int lpn, ppn_t ppn); //Jieun add
+ #endif
+diff --git QEMU/hw/block/nvme.c QEMU/hw/block/nvme.c
+index 7d08f62..7bbe7b2 100644
+--- QEMU/hw/block/nvme.c
++++ QEMU/hw/block/nvme.c
+@@ -248,6 +248,8 @@ static uint16_t nvme_flush(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+          BLOCK_ACCT_FLUSH);
+ 
+ #ifdef VSSIM_NVME
++	/* Jieun 20.11.16 */
++	//printf("\n CMD:FLUSH \n");
+     event_queue_entry* vssim_event = NULL; 
+     vssim_event = SSD_NVME_FLUSH(0, 0, req, nvme_rw_cb);
+ 
+@@ -276,6 +278,12 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+     int is_write = rw->opcode == NVME_CMD_WRITE ? 1 : 0;
+     enum BlockAcctType acct = is_write ? BLOCK_ACCT_WRITE : BLOCK_ACCT_READ;
+ 
++	/* Jieun 20.11.16 */
++	int control = rw->control;
++	uint32_t epoch_id = cmd->res1 >> 32;
++	int stream_id = cmd->res1 & 0xFFFFFFFF;
++	int barrier_flag = (control & (0x1<<9)) >> 9;
++
+ // 08-Jan-2018: Added by Jinsoo Yoo
+ #ifdef VSSIM_NVME
+    event_queue_entry* vssim_event = NULL; 
+@@ -298,11 +306,16 @@ static uint16_t nvme_rw(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+ 
+ // 18-Sep-2017: Added by Jinsoo Yoo
+ #ifdef VSSIM_NVME
++	/* Jieun 20.11.06 */
++	//printf("Stream id: %d\t Epoch id: %ld\t Barrier: %d\t", stream_id, epoch_id, barrier_flag);
+     if(is_write){
+-        vssim_event = SSD_NVME_WRITE(slba, nlb, req, nvme_rw_cb);
++		//printf("CMD: WRITE\n");	
++        //vssim_event = SSD_NVME_WRITE(slba, nlb, req, nvme_rw_cb);
++        vssim_event = SSD_NVME_WRITE_BARRIER(slba, nlb, req, nvme_rw_cb, stream_id, epoch_id, barrier_flag); //Jieun add
+         req->aiocb = dma_blk_write(n->conf.blk, &req->qsg, data_offset, BDRV_SECTOR_SIZE,
+                       nvme_rw_cb, req);
+     }else{
++		//printf("CMD: READ\n");
+         vssim_event = SSD_NVME_READ(slba, nlb, req, nvme_rw_cb);
+         req->aiocb = dma_blk_read(n->conf.blk, &req->qsg, data_offset, BDRV_SECTOR_SIZE,
+                      nvme_rw_cb, req);
+diff --git RAMDISK/ram_mount.sh RAMDISK/ram_mount.sh
+index 6728247..6de833f 100755
+--- RAMDISK/ram_mount.sh
++++ RAMDISK/ram_mount.sh
+@@ -7,4 +7,4 @@
+ 
+ mkdir mnt
+ chmod 0755 mnt
+-sudo mount -t tmpfs -o size=16g tmpfs ./mnt
++sudo mount -t tmpfs -o size=40g tmpfs ./mnt
+diff --git vssim_rerun.sh vssim_rerun.sh
+index 17301d8..32e0b78 100755
+--- vssim_rerun.sh
++++ vssim_rerun.sh
+@@ -8,7 +8,7 @@
+ #!/bin/bash
+ 
+ MNT="./RAMDISK/mnt"
+-QEMU_RUN_OPTION="-m 2048 -enable-kvm -vga cirrus -device nvme,drive=nvme1,serial=foo"
++QEMU_RUN_OPTION="-m 2048 -enable-kvm -vga cirrus -smp 8 -device nvme,drive=nvme1,serial=foo"
+ QEMU_NETWORK_OPTION="-net nic,model=virtio -net bridge,br=br0"
+ QEMU_IMG1="ssd_hda.img"
+ QEMU_IMG2="ssd_nvme.img"
+diff --git vssim_run.sh vssim_run.sh
+index d0e610a..9674b29 100755
+--- vssim_run.sh
++++ vssim_run.sh
+@@ -19,8 +19,8 @@ OS_IMG="ubuntu-14.04.4-desktop-amd64.iso"
+ sudo rm ./META/*.dat
+ 
+ # Create QEMU disk
+-./QEMU/qemu-img create -f qcow2 ${MNT}/${QEMU_IMG1} 8G
+-./QEMU/qemu-img create -f qcow2 ${MNT}/${QEMU_IMG2} 8G
++./QEMU/qemu-img create -f qcow2 ${MNT}/${QEMU_IMG1} 50G
++./QEMU/qemu-img create -f qcow2 ${MNT}/${QEMU_IMG2} 10G
+ 
+ # Run VSSIM
+ sudo ${QEMU_DIR}/qemu-system-x86_64 -hda ${MNT}/${QEMU_IMG1} -drive file=${MNT}/${QEMU_IMG2},if=none,id=nvme1 -cdrom ${OS_DIR}/${OS_IMG} ${QEMU_RUN_OPTION}
