@@ -1,0 +1,216 @@
+diff --git kernel/x86_64/block/blk-core.c kernel/x86_64/block/blk-core.c
+index 3ca326a..f9344c3 100755
+--- kernel/x86_64/block/blk-core.c
++++ kernel/x86_64/block/blk-core.c
+@@ -2019,16 +2019,11 @@ void submit_bio(long long/*int*/ rw, struct bio *bio)
+ 			get_epoch(current->__epoch);
+ 			bio->bi_epoch = current->__epoch;
+ 			bio->bi_epoch->pending++;
+-			mutex_lock(&q->epoch_id_lock);
+-			g_epoch_id = bio->bi_epoch->eid;
+-			mutex_unlock(&q->epoch_id_lock);
+-
++			bio->main_epoch_id = current->epoch_count;	//Jieun add	
+ 			if (bio->bi_rw & REQ_BARRIER) {
++				current->epoch_count++;
+ 				blk_finish_epoch();
+ 
+-				mutex_lock(&q->epoch_id_lock);
+-				q->epoch_complete = true;
+-				mutex_unlock(&q->epoch_id_lock);
+ 			}
+ 		}
+ 		/* end */
+@@ -2078,22 +2073,17 @@ void submit_bio64(long long rw, struct bio *bio)
+ 			get_epoch(current->__epoch);
+ 			bio->bi_epoch = current->__epoch;
+ 			bio->bi_epoch->pending++;
+-			mutex_lock(&q->epoch_id_lock);
+-			g_epoch_id = bio->bi_epoch->eid;
+-			mutex_unlock(&q->epoch_id_lock);
+-
+-			if (bio->bi_rw & REQ_BARRIER) {
++			bio->main_stream_id = current->pid;			//Jieun add
++			bio->main_epoch_id = current->epoch_count;	//Jieun add	
++		
++			if (bio->bi_rw & REQ_BARRIER) {	
++				current->epoch_count++;
+ 				blk_finish_epoch();
+ 
+-				mutex_lock(&q->epoch_id_lock);
+-				q->epoch_complete = true;
+-				mutex_unlock(&q->epoch_id_lock);
+ 			}
+ 		}
+ 	}
+ 	
+-
+-
+ 	generic_make_request(bio);
+ }
+ EXPORT_SYMBOL(submit_bio64);
+diff --git kernel/x86_64/drivers/block/nvme-core.c kernel/x86_64/drivers/block/nvme-core.c
+index b5760d7..6515473 100755
+--- kernel/x86_64/drivers/block/nvme-core.c
++++ kernel/x86_64/drivers/block/nvme-core.c
+@@ -726,12 +726,21 @@ static int nvme_submit_bio_queue(struct nvme_queue *nvmeq, struct nvme_ns *ns,
+ 	 * So it is inserted directly without typecasting.
+ 	 */
+ 	if(bio->bi_epoch) {
+-		cmnd->rw.cmd_stream_id = bio->bi_stream_id;
+-		cmnd->rw.cmd_epoch_id = bio->bi_epoch->eid;
++		//cmnd->rw.cmd_stream_id = bio->bi_stream_id;
++		//cmnd->rw.cmd_epoch_id = bio->bi_epoch->eid;
++		cmnd->rw.main_stream_id = bio->main_stream_id;
++		cmnd->rw.sub_stream_id	= bio->sub_stream_id;
++		cmnd->rw.main_eid = bio->main_epoch_id;
++		cmnd->rw.sub_eid = bio->sub_epoch_id;
+ 	}
+ 	else {
+-		cmnd->rw.cmd_stream_id = 0;
+-		cmnd->rw.cmd_epoch_id = 0;
++	//	cmnd->rw.cmd_stream_id = 0;
++	//	cmnd->rw.cmd_epoch_id = 0;
++
++		cmnd->rw.main_stream_id = 0;
++		cmnd->rw.sub_stream_id	= 0;
++		cmnd->rw.main_eid = 0;
++		cmnd->rw.sub_eid = 0;
+ 	}
+ 
+ 	if (++nvmeq->sq_tail == nvmeq->q_depth)
+diff --git kernel/x86_64/fs/buffer.c kernel/x86_64/fs/buffer.c
+index 4c0c048..c1ba946 100755
+--- kernel/x86_64/fs/buffer.c
++++ kernel/x86_64/fs/buffer.c
+@@ -3116,14 +3116,9 @@ int _submit_bh64(long long rw, struct buffer_head *bh, unsigned long long bio_fl
+ 	bio->bi_end_io = end_bio_bh_io_sync;
+ 	bio->bi_private = bh;
+ 
+-	/*
+-	 * kms91 added 19.04.05
+-	 * Initialize bi_stream_id. bi_stream_id store current process id.
+-	 * Type of bi_stream_id is pid_t,
+-	 * so it is not necessary to type casting.
+-	 */
+-	bio->bi_stream_id = current->pid;
+ 
++//	bio->main_stream_id = current->pid;
++//	bio->main_epoch_id = current->epoch_count;
+ 	/* Take care of bh's that straddle the end of the device */
+ 	guard_bh_eod(rw, bio, bh);
+ 
+diff --git kernel/x86_64/fs/ext4/page-io.c kernel/x86_64/fs/ext4/page-io.c
+index 112cc5d..e73f0a4 100755
+--- kernel/x86_64/fs/ext4/page-io.c
++++ kernel/x86_64/fs/ext4/page-io.c
+@@ -318,6 +318,8 @@ static int io_submit_init(struct ext4_io_submit *io,
+ 	struct page *page = bh->b_page;
+ 	int nvecs = bio_get_nr_vecs(bh->b_bdev);
+ 	struct bio *bio;
++	
++	handle_t *handle = ext4_journal_current_handle();	//Jieun add
+ 
+ 	io_end = ext4_init_io_end(inode, GFP_NOFS);
+ 	if (!io_end)
+@@ -328,14 +330,22 @@ static int io_submit_init(struct ext4_io_submit *io,
+ 	bio->bi_private = io->io_end = io_end;
+ 	bio->bi_end_io = ext4_end_bio;
+ 
+-	/* 
+-	 * kms91 added 19.04.05
+-	 * Initialize bi_stream_id. bi_stream_id store current process id.
+-	 * Type of bi_stream_id is pid_t, 
+-	 * so it is not necessary to type casting.
+-	 */
+-	bio->bi_stream_id = current->pid;
+-
++	//Jieun add
++	bio->main_stream_id	= current->pid;
++	bio->sub_stream_id = 0;_	
++	//Check whether this request have to be enforced double ordering constraint
++	//fsync() case
++	if(wbc->sync_mode == WB_ORDERED_ALL){ //fsync
++		bio->sub_stream_id	= handle->h_transaction->t_journal->j_task->pid;
++		bio->sub_epoch_id = handle->h_transaction->t_journal->j_task->epoch_count;
++	}
++	else if(wbc->sync_mode == WB_BARRIER_ALL){	//fdatasync
++		//Check whether JBD2 thread will wake up after dispatching this request
++		if(handle->h_transaction->t_tid == EXT4_I(inode)->i_datasync_tid){
++			bio->sub_stream_id	= handle->h_transaction->t_journal->j_task->pid;
++			bio->sub_epoch_id = handle->h_transaction->t_journal->j_task->epoch_count;
++		}
++	}
+ 
+ 	io_end->offset = (page->index << PAGE_CACHE_SHIFT) + bh_offset(bh);
+ 
+diff --git kernel/x86_64/include/linux/blk_types.h kernel/x86_64/include/linux/blk_types.h
+index c72f3da..e36ebf0 100755
+--- kernel/x86_64/include/linux/blk_types.h
++++ kernel/x86_64/include/linux/blk_types.h
+@@ -43,11 +43,12 @@ struct bio {
+ 	/*unsigned long		bi_rw;*/		/* bottom bits READ/WRITE,
+ 						 * top bits priority
+ 						 */
++	//Jieun add
++	short				main_stream_id;	
++	short				sub_stream_id;
++	unsigned short		main_epoch_id;
++	unsigned short		sub_epoch_id;
+ 
+-	pid_t			bi_stream_id;	/* kms91 added 19.04.04 - stream id (PID)
+-						 * This variable store process id (PID) as stream id
+-						 * So, type of this var is pid_t (signed int)
+-						 */
+ 
+ 	unsigned short		bi_vcnt;	/* how many bio_vec's */
+ 	unsigned short		bi_idx;		/* current index into bvl_vec */
+diff --git kernel/x86_64/include/linux/nvme.h kernel/x86_64/include/linux/nvme.h
+index f95b775..3e97cac 100755
+--- kernel/x86_64/include/linux/nvme.h
++++ kernel/x86_64/include/linux/nvme.h
+@@ -220,11 +220,12 @@ struct nvme_rw_command {
+ 	__u16			command_id;
+ 	__le32			nsid;
+ 	//__u64			rsvd2;		/* kms91 edit - __u32 for epoch_id, __s32 for stream_id */
+-	__s32			cmd_stream_id;	/* kms91 added 19.04. 05 - stream id
+-						 * It stores Process id (PID) as stream id
+-						 * type is signed int (=pid_t)
+-						 */
+-	__u32			cmd_epoch_id;	/* kms91 added 19.03.18 - epoch id */
++	//Jieun add
++	__s16			main_stream_id;
++	__s16			sub_stream_id;
++	__u16			main_eid;
++	__u16			sub_eid;
++
+ 	__le64			metadata;
+ 	__le64			prp1;
+ 	__le64			prp2;
+diff --git kernel/x86_64/include/linux/sched.h kernel/x86_64/include/linux/sched.h
+index 6c75fcf..a78938e 100755
+--- kernel/x86_64/include/linux/sched.h
++++ kernel/x86_64/include/linux/sched.h
+@@ -1452,6 +1452,8 @@ struct task_struct {
+         struct epoch *__epoch;
+ 	unsigned int barrier_fail;
+ 	unsigned int epoch_fail;
++
++	unsigned short	epoch_count;	//Jieun add
+ 	//struct list_head epoch_pending;
+ 	//struct list_head epoch_dispatch;
+ 	//struct list_head epoch_complte;
+diff --git kernel/x86_64/kernel/fork.c kernel/x86_64/kernel/fork.c
+index 6852035..bee6815 100755
+--- kernel/x86_64/kernel/fork.c
++++ kernel/x86_64/kernel/fork.c
+@@ -315,6 +315,9 @@ static struct task_struct *dup_task_struct(struct task_struct *orig)
+ 	tsk->__epoch = 0;
+ 	tsk->barrier_fail = 0;
+ 	tsk->epoch_fail = 0;
++	
++	//Jieun add
++	tsk->epoch_count = 0;
+ 
+ 	tsk->stack = ti;
+ 
