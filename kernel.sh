@@ -1,7 +1,7 @@
 cd /home/jieun/barrieriostack
 git checkout mq_barrier
-cp /home/jieun/patchfile/patch_05_11_flush_cmd /home/jieun/barrieriostack
-patch -p0 < patch_05_11_flush_cmd
+cp /home/jieun/patchfile/patch_nvme_barrier /home/jieun/barrieriostack
+patch -p0 < patch_nvme_barrier
 cd ./kernel/x86_64
 cp /boot/config-4.2.0-27-generic ./.config
 sudo make menuconfig
