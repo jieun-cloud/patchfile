@@ -1,16 +1,19 @@
 HOME_PATH="/home/jieun"
 KERNEL_PATH=${HOME_PATH}/Downloads
 KERNEL_FILE=$(ls ${HOME_PATH}/Downloads|grep linux)
+PATCHFILE="3.10.61_mod"
 #echo ${KERNEL_FILE}
 cd ${KERNEL_PATH}
-#tar -zxvf ${KERNEL_FILE}
+tar -zxvf ${KERNEL_FILE}
 LIST=$(sudo find ${KERNEL_PATH} -type f -name *.tar.gz|grep 3.10.61)
 NAME=$(basename ${LIST})
 KERNEL_FILE_NAME="${NAME%.tar.gz}"
 #echo ${KERNEL_FILE_NAME}
 mv ${KERNEL_FILE_NAME} ${HOME_PATH}
+cp ${HOME_PATH}/patchfile/${PATCHFILE} ${HOME_PATH}/${KERNEL_FILE_NAME}
 cd ${HOME_PATH}/${KERNEL_FILE_NAME}/
-
+git init
+patch -p0 < ${PATCHFILE}
 
 #mv /home/jieun/Downloads/linux-3.10.61
 #cd /home/jieun/barrieriostack
