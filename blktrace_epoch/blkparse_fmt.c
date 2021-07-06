@@ -247,6 +247,7 @@ static void print_field(char *act, struct per_cpu_info *pci,
 	case 'z':
 		fprintf(ofp, strcat(format, "s"), print_time(t->time));
 		break;
+	/*
 	case 'E':
 		fprintf(ofp, strcat(format, "d"), t->epoch_1);
 		break;
@@ -259,6 +260,7 @@ static void print_field(char *act, struct per_cpu_info *pci,
 	case 'l':
 		fprintf(ofp, strcat(format, "d"), t->stream_2);
 		break;
+	*/
 	default:
 		fprintf(ofp,strcat(format, "c"), field);
 		break;

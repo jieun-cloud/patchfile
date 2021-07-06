@@ -104,10 +104,10 @@ struct blk_io_trace {
 	__u32 cpu;		/* on what cpu did it happen */
 	__u16 error;		/* completion error */
 	__u16 pdu_len;		/* length of data after this trace */
-	__u16 epoch_1;		/* Epoch ID 1 - Jieun add */
-	__u16 epoch_2;		/* Epoch ID 2 - Jieun add */
-	__s16 stream_1;		/* Stream ID 1 - Jieun add */
-	__s16 stream_2;		/* Stream ID 2 - Jieun add */
+	//__u16 epoch_1;		/* Epoch ID 1 - Jieun add */
+	//__u16 epoch_2;		/* Epoch ID 2 - Jieun add */
+	//__s16 stream_1;		/* Stream ID 1 - Jieun add */
+	//__s16 stream_2;		/* Stream ID 2 - Jieun add */
 };
 
 /*
