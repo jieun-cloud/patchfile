@@ -8,12 +8,15 @@ num=1
 EXE_TIME=$(expr ${NOW} + ${num})
 #echo ${EXE_TIME}
 
+FILEBENCH_PATH="/home/jieun/filebench/workloads"
+WORKLOAD="myvarmail.f"
 
 #echo -n "Type timestamp to execute"
 #read EXE_TIME
 #echo ${EXE_TIME}
 
-
+echo NOW ${NOW}
+echo Timestamp to execute ${EXE_TIME}
 while :
 do
 	NOW=$(date +%M)
@@ -21,6 +24,7 @@ do
 	#echo ${EXE_TIME}
 	if [[ ${NOW} == ${EXE_TIME} ]] ; then
 	  echo Execute
+	  sudo filebench -f ${FILEBENCH_PATH}/${WORKLOAD}
 	  break
 	fi
 done
