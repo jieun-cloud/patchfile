@@ -1,0 +1,60 @@
+diff --git kernel/x86_64/block/blk-core.c kernel/x86_64/block/blk-core.c
+index 3ca326a..c889648 100755
+--- kernel/x86_64/block/blk-core.c
++++ kernel/x86_64/block/blk-core.c
+@@ -1847,6 +1847,7 @@ generic_make_request_checks(struct bio *bio)
+ 	 * drivers without flush support don't have to worry
+ 	 * about them.
+ 	 */
++	/*
+ 	if ((bio->bi_rw & (REQ_FLUSH | REQ_FUA)) && !q->flush_flags) {
+ 		bio->bi_rw &= ~(REQ_FLUSH | REQ_FUA);
+ 		if (!nr_sectors) {
+@@ -1854,7 +1855,7 @@ generic_make_request_checks(struct bio *bio)
+ 			goto end_io;
+ 		}
+ 	}
+-
++	*/
+ 	if ((bio->bi_rw & REQ_DISCARD) &&
+ 	    (!blk_queue_discard(q) ||
+ 	     ((bio->bi_rw & REQ_SECURE) && !blk_queue_secdiscard(q)))) {
+@@ -2019,9 +2020,9 @@ void submit_bio(long long/*int*/ rw, struct bio *bio)
+ 			get_epoch(current->__epoch);
+ 			bio->bi_epoch = current->__epoch;
+ 			bio->bi_epoch->pending++;
+-			mutex_lock(&q->epoch_id_lock);
+-			g_epoch_id = bio->bi_epoch->eid;
+-			mutex_unlock(&q->epoch_id_lock);
++			//mutex_lock(&q->epoch_id_lock);
++			//g_epoch_id = bio->bi_epoch->eid;
++			//mutex_unlock(&q->epoch_id_lock);
+ 
+ 			if (bio->bi_rw & REQ_BARRIER) {
+ 				blk_finish_epoch();
+@@ -2078,9 +2079,9 @@ void submit_bio64(long long rw, struct bio *bio)
+ 			get_epoch(current->__epoch);
+ 			bio->bi_epoch = current->__epoch;
+ 			bio->bi_epoch->pending++;
+-			mutex_lock(&q->epoch_id_lock);
+-			g_epoch_id = bio->bi_epoch->eid;
+-			mutex_unlock(&q->epoch_id_lock);
++			//mutex_lock(&q->epoch_id_lock);
++			//g_epoch_id = bio->bi_epoch->eid;
++			//mutex_unlock(&q->epoch_id_lock);
+ 
+ 			if (bio->bi_rw & REQ_BARRIER) {
+ 				blk_finish_epoch();
+diff --git kernel/x86_64/fs/jbd2/revoke.c kernel/x86_64/fs/jbd2/revoke.c
+index 0a078ae..5ebe34a 100755
+--- kernel/x86_64/fs/jbd2/revoke.c
++++ kernel/x86_64/fs/jbd2/revoke.c
+@@ -132,7 +132,7 @@ static void write_one_revoke_record64(journal_t *, transaction_t *,
+ 				struct list_head *,
+ 				struct buffer_head **, int*,
+ 				struct jbd2_revoke_record_s *, long long);
+-static void flush_descriptor64(journal_t *, struct buffer_ehad *, int, long long);
++static void flush_descriptor64(journal_t *, struct buffer_head *, int, long long);
+ #endif
+ 
+ /* Utility functions to maintain the revoke table */
